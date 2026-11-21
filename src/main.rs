@@ -332,8 +332,10 @@ fn main() {
         });
         o.buf = buf;
     });
+    timing(t0, "lparse");
     let n_links: usize = outs.iter().map(|o| o.lock().unwrap().links.len()).sum();
     let uf = uf::Uf::new(2 * n_links);
+    timing(t0, "ufalloc");
     {
         let guards: Vec<_> = outs.iter().map(|o| o.lock().unwrap()).collect();
         let link_vecs: Vec<&Vec<(u64, u64)>> = guards.iter().map(|g| &g.links).collect();
@@ -354,6 +356,7 @@ fn main() {
             }
         });
     }
+    timing(t0, "unions");
     let lmap = uf::LinkMap::build(&uf, &|n, f| run_parallel(threads, n, |_, t| f(t)));
     drop(uf);
     for o in &outs {

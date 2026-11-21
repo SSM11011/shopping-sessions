@@ -168,7 +168,8 @@ fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: 
         } else {
             len
         };
-        let qd = ((a_mask >> fs) & 1) as usize;
+        // a validated line has quotes only in pairs at field edges, so the first byte decides
+        let qd = (unsafe { *buf.get_unchecked(s + fs) } == b'"') as usize;
         *slot = unsafe { buf.get_unchecked(s + fs + qd..s + fe - qd) };
         fs = fe + 1;
     }

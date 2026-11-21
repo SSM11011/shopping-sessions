@@ -98,6 +98,9 @@ impl Uf {
 
 /// Read-only key -> person name map holding only IDs whose name differs from themselves, behind a
 /// one-word-per-key Bloom filter: unlinked IDs and component roots (the common case) skip the table.
+struct SendPtr<T>(*mut T);
+unsafe impl<T> Sync for SendPtr<T> {}
+
 pub struct LinkMap {
     mask: usize,
     slots: Vec<(u64, u64)>,
@@ -114,53 +117,80 @@ impl LinkMap {
     /// Builds from a finished Uf. `par` runs closures over index ranges in parallel.
     pub fn build(uf: &Uf, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Self {
         let cap_in = uf.cap();
-        // count non-roots
         let per = 1 << 16;
         let ntask = cap_in.div_ceil(per);
+        // pass 1: resolve every slot once (name, or EMPTY for empty slots and roots), count non-roots
+        let mut names: Vec<u64> = Vec::with_capacity(cap_in);
+        let np = SendPtr(names.as_mut_ptr());
         let counts: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(0)).collect();
         par(ntask, &|t| {
+            let np = &np;
             let mut c = 0;
             for i in t * per..((t + 1) * per).min(cap_in) {
-                if let Some((k, name)) = uf.resolved(i) {
-                    if k != name {
+                let v = match uf.resolved(i) {
+                    Some((k, name)) if k != name => {
                         c += 1;
+                        name
                     }
-                }
+                    _ => EMPTY,
+                };
+                unsafe { *np.0.add(i) = v };
             }
             counts[t].store(c, Relaxed);
         });
+        unsafe { names.set_len(cap_in) };
         let n: usize = counts.iter().map(|c| c.load(Relaxed) as usize).sum();
         let cap = (n * 2 + 1).next_power_of_two().max(64);
-        let keys: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(EMPTY)).collect();
-        let vals: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(0)).collect();
         let bwords = (n * 10 / 64 + 1).next_power_of_two().max(64);
-        let bloom: Vec<AtomicU64> = (0..bwords).map(|_| AtomicU64::new(0)).collect();
         let mask = cap - 1;
         let bmask = bwords - 1;
+        let mut slots: Vec<(u64, u64)> = Vec::with_capacity(cap);
+        let mut bloom: Vec<u64> = Vec::with_capacity(bwords);
+        let sp = SendPtr(slots.as_mut_ptr());
+        let bp = SendPtr(bloom.as_mut_ptr());
+        // parallel init (also spreads the page faults over threads)
+        let ip = 1 << 16;
+        par(cap.div_ceil(ip), &|t| {
+            let sp = &sp;
+            for i in t * ip..((t + 1) * ip).min(cap) {
+                unsafe { *sp.0.add(i) = (EMPTY, 0) };
+            }
+        });
+        par(bwords.div_ceil(ip), &|t| {
+            let bp = &bp;
+            for i in t * ip..((t + 1) * ip).min(bwords) {
+                unsafe { *bp.0.add(i) = 0 };
+            }
+        });
+        unsafe {
+            slots.set_len(cap);
+            bloom.set_len(bwords);
+        }
+        // pass 2: insert non-roots (CAS on the key word, plain store of the value)
         par(ntask, &|t| {
+            let (sp, bp) = (&sp, &bp);
             for i in t * per..((t + 1) * per).min(cap_in) {
-                let Some((k, name)) = uf.resolved(i) else { continue };
-                if k == name {
+                let name = names[i];
+                if name == EMPTY {
                     continue;
                 }
+                let k = uf.keys[i].load(Relaxed);
                 let h = hash(k);
-                bloom[(h >> 40) as usize & bmask].fetch_or(bloom_bits(h), Relaxed);
+                unsafe {
+                    AtomicU64::from_ptr(bp.0.add((h >> 40) as usize & bmask)).fetch_or(bloom_bits(h), Relaxed);
+                }
                 let mut j = h as usize & mask;
                 loop {
-                    if keys[j].compare_exchange(EMPTY, k, Relaxed, Relaxed).is_ok() {
-                        vals[j].store(name, Relaxed);
+                    let kp = unsafe { AtomicU64::from_ptr(&raw mut (*sp.0.add(j)).0) };
+                    if kp.compare_exchange(EMPTY, k, Relaxed, Relaxed).is_ok() {
+                        unsafe { (*sp.0.add(j)).1 = name };
                         break;
                     }
                     j = (j + 1) & mask;
                 }
             }
         });
-        LinkMap {
-            mask,
-            slots: keys.into_iter().zip(vals).map(|(k, v)| (k.into_inner(), v.into_inner())).collect(),
-            bloom: bloom.into_iter().map(|b| b.into_inner()).collect(),
-            bmask,
-        }
+        LinkMap { mask, slots, bloom, bmask }
     }
 
     #[inline(always)]
