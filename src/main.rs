@@ -2,6 +2,7 @@ mod arena;
 mod keys;
 mod out;
 mod pq;
+mod prof;
 mod scan;
 mod ts;
 mod uf;
@@ -26,7 +27,7 @@ const NO_TS: u32 = u32::MAX;
 
 /// Event candidate: kept for dedup even when invalid (ts == NO_TS). 28 bytes.
 #[derive(Clone, Copy)]
-#[repr(C, packed(4))]
+#[repr(C, align(32))]
 struct Ev {
     eid: u64,
     user: u64,
@@ -375,6 +376,7 @@ fn timing(t0: Instant, what: &str) {
 
 fn main() {
     let t0 = Instant::now();
+    prof::start();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let outdir = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads: usize = std::env::var("NCPU")
@@ -826,6 +828,7 @@ fn main() {
     }
     out::write_all(&outdir, &results, &camp_acc, &camp_ids, &channels, &cat_names, ws_day, ndays, threads);
     timing(t0, "total");
+    prof::dump();
     std::process::exit(0);
 }
 
