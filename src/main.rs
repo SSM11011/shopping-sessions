@@ -388,6 +388,11 @@ fn main() {
             })
         })
         .collect();
+    // pre-fault what the parse will write (events 28 B, clicks 24 B, one open block per partition list)
+    if std::env::var_os("SESSIONS_POP").is_some() {
+        let per = (est_rows * 28 + est_clicks * 24) / threads * 11 / 10 + 2 * nparts * BLOCK;
+        run_parallel(threads, threads, |_, t| arenas[t].populate(per));
+    }
     timing(t0, "setup");
     if std::env::var_os("EXP_MICRO").is_some() {
         micro(&files, &ctx, ws);

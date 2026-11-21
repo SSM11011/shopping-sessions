@@ -40,6 +40,17 @@ impl Arena {
         }
     }
 
+    /// Pre-fault the first `bytes` of the arena in one kernel call (MADV_POPULATE_WRITE, Linux 5.14+);
+    /// silently does nothing where unsupported.
+    pub fn populate(&self, bytes: usize) {
+        let bytes = bytes.min(self.cap) & !((2 << 20) - 1);
+        if bytes > 0 && !self.base.is_null() {
+            unsafe {
+                libc::madvise(self.base as *mut libc::c_void, bytes, 23 /* MADV_POPULATE_WRITE */);
+            }
+        }
+    }
+
     fn block(&self) -> *mut u8 {
         match unsafe { (*self.free.get()).pop() } {
             Some(p) => p,
