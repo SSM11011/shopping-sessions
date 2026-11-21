@@ -1,6 +1,7 @@
 mod arena;
 mod keys;
 mod out;
+mod pq;
 mod scan;
 mod ts;
 mod uf;
