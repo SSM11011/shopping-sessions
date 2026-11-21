@@ -59,10 +59,13 @@ impl Arena {
 }
 
 /// Append-only list of fixed-size blocks allocated from an Arena.
+/// Append-only list of BLOCK-sized blocks. The hot write state (cursor, end) sits first so a push is
+/// one compare and one store.
+#[repr(C)]
 pub struct Blocks<T: Copy> {
+    cur: *mut T,
+    end: *mut T,
     blocks: Vec<*mut T>,
-    last_len: usize,
-    per: usize,
     _p: PhantomData<T>,
 }
 
@@ -76,42 +79,56 @@ impl<T: Copy> Default for Blocks<T> {
 }
 
 impl<T: Copy> Blocks<T> {
+    const PER: usize = BLOCK / std::mem::size_of::<T>();
+
     pub fn new() -> Self {
-        let per = BLOCK / std::mem::size_of::<T>();
-        Blocks { blocks: Vec::new(), last_len: per, per, _p: PhantomData }
+        Blocks { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), _p: PhantomData }
     }
 
     /// Hands every block to `arena`'s free list (the data is dead afterwards).
     pub fn recycle(&mut self, arena: &Arena) {
         let f = unsafe { &mut *arena.free.get() };
         f.extend(self.blocks.drain(..).map(|b| b as *mut u8));
-        self.last_len = self.per;
+        self.cur = std::ptr::null_mut();
+        self.end = std::ptr::null_mut();
     }
 
     #[inline(always)]
     pub fn push(&mut self, arena: &Arena, v: T) {
-        if self.last_len == self.per {
+        if self.cur == self.end {
             self.grow(arena);
         }
-        unsafe { *self.blocks.last().unwrap_unchecked().add(self.last_len) = v };
-        self.last_len += 1;
+        unsafe {
+            self.cur.write_unaligned(v);
+            self.cur = self.cur.add(1);
+        }
     }
 
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &Arena) {
-        self.blocks.push(arena.block() as *mut T);
-        self.last_len = 0;
+        let b = arena.block() as *mut T;
+        self.blocks.push(b);
+        self.cur = b;
+        self.end = unsafe { b.add(Self::PER) };
+    }
+
+    fn last_len(&self) -> usize {
+        match self.blocks.last() {
+            Some(&b) => (self.cur as usize - b as usize) / std::mem::size_of::<T>(),
+            None => 0,
+        }
     }
 
     pub fn len(&self) -> usize {
-        if self.blocks.is_empty() { 0 } else { (self.blocks.len() - 1) * self.per + self.last_len }
+        if self.blocks.is_empty() { 0 } else { (self.blocks.len() - 1) * Self::PER + self.last_len() }
     }
 
     pub fn for_each_slice(&self, mut f: impl FnMut(&[T])) {
         let n = self.blocks.len();
+        let last = self.last_len();
         for (i, &b) in self.blocks.iter().enumerate() {
-            let len = if i + 1 == n { self.last_len } else { self.per };
+            let len = if i + 1 == n { last } else { Self::PER };
             f(unsafe { std::slice::from_raw_parts(b, len) });
         }
     }

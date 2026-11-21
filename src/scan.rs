@@ -199,7 +199,7 @@ pub fn lines<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f:
     debug_assert!(buf.len() >= end + PAD);
     let p = buf.as_ptr();
     let mut fields: [&'a [u8]; N] = [&buf[0..0]; N];
-    let mut ends = [0u32; 640];
+    let mut ends = [0u32; 640]; // 512 + one block of 64 + slack
     let mut line_start = start;
     let mut scan = start;
     while line_start < end {
@@ -209,11 +209,26 @@ pub fn lines<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f:
             if end - scan < 64 {
                 m &= (1u64 << (end - scan)) - 1;
             }
-            while m != 0 {
-                ends[cnt] = (scan + m.trailing_zeros() as usize) as u32;
-                cnt += 1;
-                m &= m - 1;
+            // branch-free for up to 4 newlines per block (tz of 0 is 64: written but not counted)
+            let k = m.count_ones() as usize;
+            let base = scan as u32;
+            ends[cnt] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 1] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 2] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 3] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            if k > 4 {
+                let mut j = cnt + 4;
+                while m != 0 {
+                    ends[j] = base + m.trailing_zeros();
+                    m &= m - 1;
+                    j += 1;
+                }
             }
+            cnt += k;
             scan += 64;
         }
         for &e in &ends[..cnt] {

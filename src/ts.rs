@@ -131,6 +131,16 @@ fn time_of_day(s: &[u8]) -> Option<i64> {
     Some(h * 3600 + m * 60 + sec)
 }
 
+/// 8 ASCII digits, first digit in the lowest byte -> value.
+#[inline(always)]
+pub fn parse8(x: u64) -> u64 {
+    let x = x.wrapping_sub(0x3030_3030_3030_3030);
+    let x = x.wrapping_mul(10).wrapping_add(x >> 8);
+    (((x & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+        .wrapping_add(((x >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+        >> 32
+}
+
 /// Exactly 13 ASCII digits (epoch ms for years 2001..2286) -> value.
 #[inline(always)]
 fn digits13(s: &[u8]) -> Option<i64> {
@@ -140,14 +150,6 @@ fn digits13(s: &[u8]) -> Option<i64> {
         && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030;
     if !ok(a) || !ok(b) {
         return None;
-    }
-    #[inline(always)]
-    fn parse8(x: u64) -> u64 {
-        let x = x.wrapping_sub(0x3030_3030_3030_3030);
-        let x = x.wrapping_mul(10).wrapping_add(x >> 8);
-        (((x & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
-            .wrapping_add(((x >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
-            >> 32
     }
     // value = first 8 digits * 10^5 + last 5 digits; last 5 = parse8(b) mod 10^5 (b holds digits 5..13)
     let hi = parse8(a);

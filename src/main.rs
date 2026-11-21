@@ -121,6 +121,29 @@ impl NumMap {
             }
         }
     }
+    /// `get` for a field inside a zero-padded buffer (reads up to 8 bytes past the prefix).
+    #[inline(always)]
+    unsafe fn get_padded(&self, s: &[u8]) -> Option<u32> {
+        let p = self.prefix.len();
+        let d = s.len().wrapping_sub(p);
+        if d.wrapping_sub(1) < 8 && s[..p] == *self.prefix && s[p] != b'0' {
+            let x = unsafe { (s.as_ptr().add(p) as *const u64).read_unaligned() };
+            // right-align the d digits in the high bytes, pad the low bytes with '0'
+            let sh = 8 * (8 - d) as u32;
+            let y = if d == 8 { x } else { (x << sh) | (0x3030_3030_3030_3030u64 >> (64 - sh)) };
+            if (y & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+                && (y.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+            {
+                let n = ts::parse8(y) as usize;
+                if n < self.table.len() {
+                    let v = self.table[n];
+                    return if v == u32::MAX { None } else { Some(v) };
+                }
+            }
+        }
+        self.get(s)
+    }
+
     #[inline(always)]
     fn get(&self, s: &[u8]) -> Option<u32> {
         if let Some(n) = self.num(s) {
@@ -419,7 +442,7 @@ fn main() {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
-                    let Some(camp) = ctx.campaigns.get(f[2]) else { return };
+                    let Some(camp) = (unsafe { ctx.campaigns.get_padded(f[2]) }) else { return };
                     let Some(t) = o.tsf.parse(f[3]) else { return };
                     if t < ws - WEEK || t >= we {
                         return;
@@ -767,7 +790,7 @@ fn validate(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ingest: i64) -> Optio
     if ingest - t > DAY {
         return None;
     }
-    let cat = ctx.products.get(f[5]).unwrap_or(ctx.unknown_cat);
+    let cat = unsafe { ctx.products.get_padded(f[5]) }.unwrap_or(ctx.unknown_cat);
     Some(((t - ctx.ws) as u32, price, cat))
 }
 
@@ -1000,5 +1023,69 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
         scan::lines::<7>(&buf, start, end, |f| if let Some(ev) = parse_event(ctx, &mut tf, f, ib) { parts[(hash(ev.eid) >> 53) as usize].push(&arena, ev) });
         parts.iter().map(|p| p.len() as u64).sum()
     });
+    // ablations: each drops one piece of parse_event
+    run("ev-no-ts", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0);
+        let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
+        c = c.wrapping_add(eid ^ u ^ ing as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[2].len() as u64); }); c });
+    run("ev-no-ing", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+        let eid = unsafe { keys::key_padded(f[0]) }; let t = tf.parse(f[2]).unwrap_or(0);
+        let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
+        c = c.wrapping_add(eid ^ u ^ t as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[3].len() as u64); }); c });
+    run("ev-no-keys", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+        let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
+        let p = ctx.products.get(f[5]).unwrap_or(0);
+        c = c.wrapping_add(f[0].len() as u64 ^ f[1].len() as u64 ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
+    run("ev-no-prod", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
+        let u = unsafe { keys::key_padded(f[1]) };
+        c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ f[5].len() as u64 ^ f[4].len() as u64); }); c });
+    run("ev-all4", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
+        let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
+        c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
     run("validate", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, &mut tf, f, 0).map_or(0, |v| v.0 as u64)); c });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn nummap_padded_matches() {
+        let mut m = NumMap::new(b"p");
+        for i in [1usize, 2, 7, 10, 99, 100, 5000, 49999, 50000, 12345678, 99999999] {
+            m.insert(format!("p{i}").as_bytes(), i as u32 % 1000);
+        }
+        m.insert(b"P5", 1);
+        m.insert(b"p050", 2);
+        m.insert(b"x", 3);
+        let mut x: u64 = 3;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789pP x\x00";
+        for _ in 0..300_000 {
+            let n = (rnd() % 11) as usize;
+            let mut buf = vec![0u8; 32];
+            for b in buf.iter_mut().take(16) {
+                *b = alpha[(rnd() % alpha.len() as u64) as usize];
+            }
+            if rnd() % 2 == 0 {
+                buf[0] = b'p';
+                for b in buf.iter_mut().take(n).skip(1) {
+                    *b = b'0' + (rnd() % 10) as u8;
+                }
+            }
+            let s = &buf[..n];
+            assert_eq!(unsafe { m.get_padded(s) }, m.get(s), "{:?}", s);
+        }
+        for k in [&b"p1"[..], b"p50000", b"p12345678", b"p99999999", b"p050", b"P5", b"x", b"p0", b"p"] {
+            let mut buf = k.to_vec();
+            buf.extend_from_slice(&[0u8; 16]);
+            assert_eq!(unsafe { m.get_padded(&buf[..k.len()]) }, m.get(k), "{:?}", k);
+        }
+    }
 }
