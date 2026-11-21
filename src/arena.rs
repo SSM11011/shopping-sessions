@@ -8,7 +8,11 @@ pub struct Arena {
     base: *mut u8,
     cap: usize,
     used: AtomicUsize,
+    /// recycled BLOCK-sized blocks (only touched by the arena's own worker thread)
+    free: std::cell::UnsafeCell<Vec<*mut u8>>,
 }
+
+pub const BLOCK: usize = 16 << 10;
 
 // Each arena is only bumped by its own worker thread; the atomic just makes that Sync-safe.
 unsafe impl Send for Arena {}
@@ -27,10 +31,17 @@ impl Arena {
                 0,
             );
             if p == libc::MAP_FAILED {
-                return Arena { base: std::ptr::null_mut(), cap: 0, used: AtomicUsize::new(0) };
+                return Arena { base: std::ptr::null_mut(), cap: 0, used: AtomicUsize::new(0), free: Default::default() };
             }
             libc::madvise(p, cap, libc::MADV_HUGEPAGE);
-            Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0) }
+            Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), free: Default::default() }
+        }
+    }
+
+    fn block(&self) -> *mut u8 {
+        match unsafe { (*self.free.get()).pop() } {
+            Some(p) => p,
+            None => self.alloc(BLOCK),
         }
     }
 
@@ -58,10 +69,23 @@ pub struct Blocks<T: Copy> {
 unsafe impl<T: Copy + Send> Send for Blocks<T> {}
 unsafe impl<T: Copy + Sync> Sync for Blocks<T> {}
 
+impl<T: Copy> Default for Blocks<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Copy> Blocks<T> {
-    pub fn new(block_bytes: usize) -> Self {
-        let per = (block_bytes / std::mem::size_of::<T>()).max(1);
+    pub fn new() -> Self {
+        let per = BLOCK / std::mem::size_of::<T>();
         Blocks { blocks: Vec::new(), last_len: per, per, _p: PhantomData }
+    }
+
+    /// Hands every block to `arena`'s free list (the data is dead afterwards).
+    pub fn recycle(&mut self, arena: &Arena) {
+        let f = unsafe { &mut *arena.free.get() };
+        f.extend(self.blocks.drain(..).map(|b| b as *mut u8));
+        self.last_len = self.per;
     }
 
     #[inline(always)]
@@ -76,7 +100,7 @@ impl<T: Copy> Blocks<T> {
     #[cold]
     #[inline(never)]
     fn grow(&mut self, arena: &Arena) {
-        self.blocks.push(arena.alloc(self.per * std::mem::size_of::<T>()) as *mut T);
+        self.blocks.push(arena.block() as *mut T);
         self.last_len = 0;
     }
 

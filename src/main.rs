@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use arena::{Arena, Blocks};
+use arena::{Arena, Blocks, BLOCK};
 use keys::{cmp_key, hash, key};
 use ts::DAY;
 
@@ -25,24 +25,29 @@ const GAP: u32 = 1_800_000;
 const NO_TS: u32 = u32::MAX;
 const CHUNK: usize = 2 << 20;
 
-/// Event candidate: kept for dedup even when invalid (ts == NO_TS).
+/// Event candidate: kept for dedup even when invalid (ts == NO_TS). 28 bytes.
 #[derive(Clone, Copy)]
+#[repr(C, packed(4))]
 struct Ev {
     eid: u64,
     user: u64,
     ingest: u32,
     ts: u32,
-    price: u32,
-    cat: u32,
+    /// price (low 24 bits, 0 unless a purchase) | category << 24
+    pc: u32,
 }
 
-/// A surviving event, keyed by person.
+/// A surviving event, keyed by person. 16 bytes.
 #[derive(Clone, Copy)]
 struct Pe {
     person: u64,
     ts: u32,
-    price: u32,
-    cat: u32,
+    pc: u32,
+}
+
+#[inline(always)]
+fn price_of(pc: u32) -> u32 {
+    pc & 0xFF_FFFF
 }
 
 /// A valid click. `user` becomes the person after link resolution.
@@ -195,7 +200,6 @@ struct ParseOut {
     tsf: ts::Fast,
 }
 
-const BLOCK: usize = 16 << 10;
 
 fn cpu_secs() -> (f64, f64) {
     let mut u: libc::rusage = unsafe { std::mem::zeroed() };
@@ -241,6 +245,7 @@ fn main() {
         products.insert(p, cat_id[c]);
     }
     let unknown_cat = cat_id[&b"unknown"[..]];
+    assert!(cat_names.len() <= 256, "more than 255 categories");
 
     let camp_bytes = read_small(&data.join("campaigns.csv"));
     let mut camp_ids: Vec<Vec<u8>> = Vec::new();
@@ -297,8 +302,8 @@ fn main() {
         .map(|_| {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
-                ev: (0..nparts).map(|_| Blocks::new(BLOCK)).collect(),
-                ck: (0..nparts).map(|_| Blocks::new(BLOCK / 2)).collect(),
+                ev: (0..nparts).map(|_| Blocks::new()).collect(),
+                ck: (0..nparts).map(|_| Blocks::new()).collect(),
                 links: Vec::new(),
                 tsf: ts::Fast::default(),
             })
@@ -373,7 +378,7 @@ fn main() {
         let buf: &[u8] = &own;
         match task.kind {
             Kind::Event => {
-                let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, price: 0, cat: 0 }; R];
+                let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
                 let mut rn = 0usize;
                 scan::lines::<7>(&buf, start, end, |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
@@ -451,21 +456,30 @@ fn main() {
     let st2: Vec<Mutex<Stage2>> = (0..threads)
         .map(|_| {
             Mutex::new(Stage2 {
-                pe: (0..nparts).map(|_| Blocks::new(BLOCK)).collect(),
+                pe: (0..nparts).map(|_| Blocks::new()).collect(),
                 gather: Vec::new(),
                 table: Vec::new(),
             })
         })
         .collect();
     let ck_parts: Vec<Vec<Blocks<Ck>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
-    let ev_in: Vec<Vec<Blocks<Ev>>> = outs.into_iter().map(|o| o.ev).collect();
+    // ev_in[t][src]: each partition's lists, taken (and recycled) by whichever worker dedups it
+    let mut ev_src: Vec<Vec<Blocks<Ev>>> = outs.into_iter().map(|o| o.ev).collect();
+    let ev_in: Vec<Mutex<Vec<Blocks<Ev>>>> = (0..nparts)
+        .map(|t| Mutex::new(ev_src.iter_mut().map(|v| std::mem::take(&mut v[t])).collect()))
+        .collect();
+    drop(ev_src);
     run_parallel(threads, nparts, |w, t| {
         let arena = &arenas[w];
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
         st.gather.clear();
-        for src in &ev_in {
-            src[t].extend_into(&mut st.gather);
+        {
+            let mut lists = ev_in[t].lock().unwrap();
+            for l in lists.iter_mut() {
+                l.extend_into(&mut st.gather);
+                l.recycle(arena);
+            }
         }
         let n = st.gather.len();
         let cap = (n * 2).next_power_of_two().max(16);
@@ -496,7 +510,7 @@ fn main() {
             if s != u32::MAX {
                 let e = unsafe { gather.get_unchecked(s as usize) };
                 if e.ts != NO_TS {
-                    st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, price: e.price, cat: e.cat });
+                    st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, pc: e.pc });
                 }
             }
         }
@@ -717,12 +731,11 @@ fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> 
         Some(v) => (v, (v.div_euclid(1000) - ing_base).clamp(0, u32::MAX as i64 - 1) as u32),
         None => (i64::MAX, u32::MAX),
     };
-    let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, price: 0, cat: 0 };
+    let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, pc: 0 };
     if let Some(v) = validate(ctx, tsf, f, ingest) {
         ev.user = unsafe { keys::key_padded(f[1]) };
         ev.ts = v.0;
-        ev.price = v.1;
-        ev.cat = v.2;
+        ev.pc = v.1 | (v.2 << 24);
     }
     Some(ev)
 }
@@ -880,12 +893,14 @@ fn person_sessions(
         while j < evs.len() && evs[j].ts - last <= GAP {
             last = evs[j].ts;
             let e = &evs[j];
-            if e.price > 0 {
+            let price = price_of(e.pc);
+            if price > 0 {
+                let cat = e.pc >> 24;
                 purchased = true;
-                rev += e.price as i64;
-                match wo.cats.iter_mut().find(|x| x.0 == e.cat) {
-                    Some(x) => x.1 += e.price as u64,
-                    None => wo.cats.push((e.cat, e.price as u64)),
+                rev += price as i64;
+                match wo.cats.iter_mut().find(|x| x.0 == cat) {
+                    Some(x) => x.1 += price as u64,
+                    None => wo.cats.push((cat, price as u64)),
                 }
             }
             j += 1;
@@ -971,7 +986,7 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     run("event", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(parse_event(ctx, &mut tf, f, ib).map_or(0, |v| v.eid ^ v.user))); c });
     run("event+push", &|| {
         let arena = Arena::new(1 << 30);
-        let mut parts: Vec<Blocks<Ev>> = (0..2048).map(|_| Blocks::new(BLOCK)).collect();
+        let mut parts: Vec<Blocks<Ev>> = (0..2048).map(|_| Blocks::new()).collect();
         let mut tf = ts::Fast::default();
         scan::lines::<7>(&buf, start, end, |f| if let Some(ev) = parse_event(ctx, &mut tf, f, ib) { parts[(hash(ev.eid) >> 53) as usize].push(&arena, ev) });
         parts.iter().map(|p| p.len() as u64).sum()
