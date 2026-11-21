@@ -137,7 +137,7 @@ unsafe fn pack16(s: &[u8]) -> Option<u64> {
     pack(s)
 }
 
-#[inline]
+#[inline(always)]
 pub fn bytes_into(k: u64, out: &mut Vec<u8>) {
     if k & EXOTIC == 0 {
         // canonical: non-zero codes then zero padding; length from the trailing zero 6-bit groups

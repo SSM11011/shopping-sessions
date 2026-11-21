@@ -1164,7 +1164,7 @@ impl WorkerOut {
         }
     }
     /// Campaign c gains a click in the window just before the session on day `day` is counted.
-    #[inline]
+    #[inline(always)]
     fn add(&mut self, c: u32, day: usize) {
         let c = c as usize;
         if self.count[c] == 0 {
@@ -1176,7 +1176,7 @@ impl WorkerOut {
         self.count[c] += 1;
     }
     /// Campaign c loses a click; `last` = day index of the last counted session (or usize::MAX for none).
-    #[inline]
+    #[inline(always)]
     fn remove(&mut self, c: u32, last: usize, ndays: usize) {
         let c = c as usize;
         self.count[c] -= 1;
@@ -1190,7 +1190,7 @@ impl WorkerOut {
         }
     }
     /// Credit campaign c with every session counted while it was active.
-    #[inline]
+    #[inline(always)]
     fn close(&mut self, c: usize, last: usize, ndays: usize) {
         if last == usize::MAX {
             return;
