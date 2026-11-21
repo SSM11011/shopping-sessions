@@ -215,45 +215,102 @@ fn pin(w: usize) {
     }
 }
 
-/// Like run_parallel, then each worker runs `fin(w)` as soon as no tasks are left for it.
-fn run_parallel_fin(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync, fin: impl Fn(usize) + Sync) {
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
+// ---------------------------------------------------------------- persistent worker pool
+// One set of worker threads for the whole run (no per-phase spawn/join, no fresh stacks per phase).
+
+type TaskFn = dyn Fn(usize, usize) + Sync;
+type FinFn = dyn Fn(usize) + Sync;
+
+struct Job {
+    f: *const TaskFn,
+    fin: *const FinFn,
+    n: usize,
+    next: AtomicUsize,
+}
+
+struct Pool {
+    state: Mutex<(u64, Option<std::sync::Arc<Job>>, usize)>, // (generation, job, workers finished)
+    cv: std::sync::Condvar,
+    done_cv: std::sync::Condvar,
+    threads: usize,
+}
+
+unsafe impl Send for Job {}
+unsafe impl Sync for Job {}
+
+fn pool(threads: usize) -> &'static Pool {
+    static P: std::sync::OnceLock<&'static Pool> = std::sync::OnceLock::new();
+    P.get_or_init(|| {
+        let p: &'static Pool = Box::leak(Box::new(Pool {
+            state: Mutex::new((0, None, 0)),
+            cv: std::sync::Condvar::new(),
+            done_cv: std::sync::Condvar::new(),
+            threads,
+        }));
         for w in 0..threads {
-            let (f, fin, next) = (&f, &fin, &next);
-            s.spawn(move || {
-                pin(w);
-                loop {
-                    let t = next.fetch_add(1, Ordering::Relaxed);
-                    if t >= n_tasks {
-                        break;
+            std::thread::Builder::new()
+                .stack_size(1 << 20)
+                .spawn(move || {
+                    pin(w);
+                    let mut seen = 0u64;
+                    loop {
+                        let job = {
+                            let mut g = p.state.lock().unwrap();
+                            while g.0 == seen {
+                                g = p.cv.wait(g).unwrap();
+                            }
+                            seen = g.0;
+                            g.1.clone().unwrap()
+                        };
+                        let (f, fin) = unsafe { (&*job.f, &*job.fin) };
+                        loop {
+                            let t = job.next.fetch_add(1, Ordering::Relaxed);
+                            if t >= job.n {
+                                break;
+                            }
+                            f(w, t);
+                        }
+                        fin(w);
+                        drop(job);
+                        let mut g = p.state.lock().unwrap();
+                        g.2 += 1;
+                        if g.2 == p.threads {
+                            p.done_cv.notify_all();
+                        }
                     }
-                    f(w, t);
-                }
-                fin(w);
-            });
+                })
+                .expect("spawn worker");
         }
+        p
+    })
+}
+
+/// Runs f(worker, task) for task in 0..n_tasks on the pool, then fin(worker) on each worker once it
+/// runs out of tasks; returns when every worker is done.
+fn run_parallel_fin(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync, fin: impl Fn(usize) + Sync) {
+    let p = pool(threads);
+    let fr: &(dyn Fn(usize, usize) + Sync + '_) = &f;
+    let finr: &(dyn Fn(usize) + Sync + '_) = &fin;
+    // the job never outlives this call: we wait below until every worker has finished with it
+    let job = std::sync::Arc::new(Job {
+        f: unsafe { std::mem::transmute::<&(dyn Fn(usize, usize) + Sync + '_), &'static TaskFn>(fr) },
+        fin: unsafe { std::mem::transmute::<&(dyn Fn(usize) + Sync + '_), &'static FinFn>(finr) },
+        n: n_tasks,
+        next: AtomicUsize::new(0),
     });
+    let mut g = p.state.lock().unwrap();
+    g.0 += 1;
+    g.1 = Some(job);
+    g.2 = 0;
+    p.cv.notify_all();
+    while g.2 < p.threads {
+        g = p.done_cv.wait(g).unwrap();
+    }
+    g.1 = None;
 }
 
 fn run_parallel(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync) {
-    let next = AtomicUsize::new(0);
-    std::thread::scope(|s| {
-        for w in 0..threads {
-            let f = &f;
-            let next = &next;
-            s.spawn(move || {
-                pin(w);
-                loop {
-                    let t = next.fetch_add(1, Ordering::Relaxed);
-                    if t >= n_tasks {
-                        break;
-                    }
-                    f(w, t);
-                }
-            });
-        }
-    });
+    run_parallel_fin(threads, n_tasks, f, |_| {});
 }
 
 #[derive(Clone, Copy, PartialEq)]
