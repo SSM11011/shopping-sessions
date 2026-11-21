@@ -23,7 +23,6 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const WEEK: i64 = 7 * DAY;
 const GAP: u32 = 1_800_000;
 const NO_TS: u32 = u32::MAX;
-const CHUNK: usize = 2 << 20;
 
 /// Event candidate: kept for dedup even when invalid (ts == NO_TS). 28 bytes.
 #[derive(Clone, Copy)]
@@ -188,6 +187,26 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// Like run_parallel, then each worker runs `fin(w)` as soon as no tasks are left for it.
+fn run_parallel_fin(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync, fin: impl Fn(usize) + Sync) {
+    let next = AtomicUsize::new(0);
+    std::thread::scope(|s| {
+        for w in 0..threads {
+            let (f, fin, next) = (&f, &fin, &next);
+            s.spawn(move || {
+                loop {
+                    let t = next.fetch_add(1, Ordering::Relaxed);
+                    if t >= n_tasks {
+                        break;
+                    }
+                    f(w, t);
+                }
+                fin(w);
+            });
+        }
+    });
+}
+
 fn run_parallel(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync) {
     let next = AtomicUsize::new(0);
     std::thread::scope(|s| {
@@ -291,6 +310,7 @@ fn main() {
     let ctx = Ctx { ws, we, products, unknown_cat, campaigns };
 
     // ---- files & tasks (events first: they are the bulk)
+    let chunk: usize = std::env::var("SESSIONS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256 << 10);
     let mut files: Vec<(File, usize)> = Vec::new();
     let mut tasks: Vec<Task> = Vec::new();
     let mut ev_bytes = 0usize;
@@ -312,7 +332,7 @@ fn main() {
             }
             let mut s = 0;
             while s < len {
-                let e = (s + CHUNK).min(len);
+                let e = (s + chunk).min(len);
                 tasks.push(Task { kind, file: fi, s, e });
                 s = e;
             }
@@ -560,7 +580,9 @@ fn main() {
     let mut order: Vec<(usize, usize)> =
         (0..nparts).map(|t| (st2.iter().map(|s| s.pe[t].len()).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
-    run_parallel(threads, nparts, |w, t| {
+    let ud_dir = outdir.join("user_daily");
+    std::fs::create_dir_all(&ud_dir).expect("mkdir");
+    run_parallel_fin(threads, nparts, |w, t| {
         let t = order[t].1;
         let mut wo = results[w].lock().unwrap();
         let wo = &mut *wo;
@@ -616,6 +638,12 @@ fn main() {
         wo.cb = cb;
         wo.evs = evs;
         wo.cks = cks;
+    }, |w| {
+        // this worker is done: write its user_daily file now, overlapping the others' session work
+        let wo = results[w].lock().unwrap();
+        if !wo.day.is_empty() || w == 0 {
+            out::write_user(&ud_dir.join(format!("part-{w:05}.parquet")), &wo, &cat_names);
+        }
     });
     let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap()).collect();
     timing(t0, "sessions");

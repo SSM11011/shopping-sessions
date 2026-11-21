@@ -148,6 +148,12 @@ fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: 
     let lm: u128 = (1u128 << len) - 1;
     let c = (c0 as u128 | ((c1 as u128) << 64)) & lm;
     let q = (q0 as u128 | ((q1 as u128) << 64)) & lm;
+    validate_extract(buf, s, len, c, q, fields)
+}
+
+/// Given the comma and quote masks of line [s, s+len), validate quoting and fill the fields.
+#[inline(always)]
+fn validate_extract<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, c: u128, q: u128, fields: &mut [&'a [u8]; N]) -> bool {
     if c.count_ones() as usize != N - 1 || len == 0 {
         return false;
     }

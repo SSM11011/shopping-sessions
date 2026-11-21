@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::pq::{self, Column, Data};
 use crate::WorkerOut;
 
-fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>]) {
+pub fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>]) {
     let rows = r.day.len();
     let mut tb = Vec::new();
     let mut te = Vec::new();
@@ -52,15 +52,8 @@ pub fn write_all(
     let cd = outdir.join("campaign_daily");
     std::fs::create_dir_all(&ud).expect("mkdir");
     std::fs::create_dir_all(&cd).expect("mkdir");
-    let any = results.iter().any(|r| !r.day.is_empty());
-    std::thread::scope(|s| {
-        for (w, r) in results.iter().enumerate() {
-            if r.day.is_empty() && (any || w > 0) {
-                continue;
-            }
-            let ud = &ud;
-            s.spawn(move || write_user(&ud.join(format!("part-{w:05}.parquet")), r, cat_names));
-        }
+    let _ = (results, cat_names, ud);
+    {
         let (mut ib, mut ie, mut cb, mut ce) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut days = Vec::new();
         let mut v: [Vec<i64>; 4] = Default::default();
@@ -96,5 +89,5 @@ pub fn write_all(
             ],
         )
         .expect("write campaign_daily");
-    });
+    }
 }
