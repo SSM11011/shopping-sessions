@@ -1013,7 +1013,8 @@ fn validate(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ingest: i64) -> Optio
     if ingest - t > DAY {
         return None;
     }
-    let cat = unsafe { ctx.products.get_padded(f[5]) }.unwrap_or(ctx.unknown_cat);
+    // category only feeds top_category (purchase revenue): skip the lookup for views and carts
+    let cat = if price > 0 { unsafe { ctx.products.get_padded(f[5]) }.unwrap_or(ctx.unknown_cat) } else { 0 };
     Some(((t - ctx.ws) as u32, price, cat))
 }
 
