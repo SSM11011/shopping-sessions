@@ -146,6 +146,12 @@ impl<T: Copy> Blocks<T> {
         Blocks { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::new(), _p: PhantomData }
     }
 
+    /// Expecting about `rows` rows: size the block-pointer list once (no reallocation while pushing).
+    pub fn with_rows(rows: usize) -> Self {
+        let blocks = rows * std::mem::size_of::<T>() / BLOCK + 2;
+        Blocks { cur: std::ptr::null_mut(), end: std::ptr::null_mut(), blocks: Vec::with_capacity(blocks), _p: PhantomData }
+    }
+
     /// Hands every block to `arena`'s free list (the data is dead afterwards).
     pub fn recycle(&mut self, arena: &Arena) {
         let f = unsafe { &mut *arena.free.get() };
@@ -160,6 +166,7 @@ impl<T: Copy> Blocks<T> {
             self.grow(arena);
         }
         unsafe {
+            prefetch_ahead(self.cur as *const u8);
             self.cur.write_unaligned(v);
             self.cur = self.cur.add(1);
         }
@@ -173,6 +180,7 @@ impl<T: Copy> Blocks<T> {
         }
         unsafe {
             let p = self.cur;
+            prefetch_ahead(p as *const u8);
             p.write_unaligned(v);
             self.cur = p.add(1);
             p
@@ -212,3 +220,16 @@ impl<T: Copy> Blocks<T> {
         self.for_each_slice(|s| out.extend_from_slice(s));
     }
 }
+
+/// Each partition list is a write stream: fetch (for write) the cache line two lines ahead of the
+/// cursor so it is owned by the time rows reach it (hides the read-for-ownership miss). A prefetch
+/// past the end of a block is harmless.
+#[inline(always)]
+unsafe fn prefetch_ahead(p: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(p.wrapping_add(PF_DIST) as *const i8, std::arch::x86_64::_MM_HINT_ET0);
+    }
+}
+
+const PF_DIST: usize = 256;

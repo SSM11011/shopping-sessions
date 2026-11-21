@@ -515,9 +515,9 @@ fn main() {
         .map(|_| {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
-                dk: (0..nparts).map(|_| Blocks::new()).collect(),
-                pe: (0..nparts).map(|_| Blocks::new()).collect(),
-                ck: (0..nparts).map(|_| Blocks::new()).collect(),
+                dk: (0..nparts).map(|_| Blocks::with_rows(est_rows * 5 / 4 / nparts / threads)).collect(),
+                pe: (0..nparts).map(|_| Blocks::with_rows(est_rows * 5 / 4 / nparts / threads)).collect(),
+                ck: (0..nparts).map(|_| Blocks::with_rows(est_clicks * 5 / 4 / nparts / threads)).collect(),
                 links: Vec::new(),
                 tsf: ts::Fast::default(),
             })
