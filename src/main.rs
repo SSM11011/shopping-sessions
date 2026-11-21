@@ -93,6 +93,16 @@ fn small_lines<const N: usize>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
 // ---------------------------------------------------------------- lookups
 
 /// Exact string -> u32 map with a dense fast path for `prefix` + decimal number (no leading zero).
+/// s starts with prefix (1 or 2 bytes in practice); byte compares instead of a memcmp call.
+#[inline(always)]
+fn prefix_eq(s: &[u8], prefix: &[u8]) -> bool {
+    match prefix.len() {
+        1 => s[0] == prefix[0],
+        2 => s[0] == prefix[0] && s[1] == prefix[1],
+        _ => s.starts_with(prefix),
+    }
+}
+
 struct NumMap {
     prefix: &'static [u8],
     table: Vec<u32>,
@@ -130,7 +140,7 @@ impl NumMap {
     #[inline(always)]
     fn num(&self, s: &[u8]) -> Option<usize> {
         let p = self.prefix.len();
-        if s.len() <= p || s.len() > p + 9 || &s[..p] != self.prefix || s[p] == b'0' {
+        if s.len() <= p || s.len() > p + 9 || !prefix_eq(s, self.prefix) || s[p] == b'0' {
             return None;
         }
         let mut n = 0usize;
@@ -161,7 +171,7 @@ impl NumMap {
     unsafe fn get_padded(&self, s: &[u8]) -> Option<u32> {
         let p = self.prefix.len();
         let d = s.len().wrapping_sub(p);
-        if d.wrapping_sub(1) < 8 && s[..p] == *self.prefix && s[p] != b'0' {
+        if d.wrapping_sub(1) < 8 && prefix_eq(s, self.prefix) && s[p] != b'0' {
             let x = unsafe { (s.as_ptr().add(p) as *const u64).read_unaligned() };
             // right-align the d digits in the high bytes, pad the low bytes with '0'
             let sh = 8 * (8 - d) as u32;
@@ -603,13 +613,21 @@ fn main() {
                 let wref = (w as u32) << 28;
                 // valid row: payload to its person partition, key (with a ref to the payload) to its
                 // event_id partition
-                let emit = |o: &mut ParseOut, ev: Ev, person: u64| {
-                    let p = o.pe[part_of(person)].push_ptr(arena, Pe { person, ts: ev.ts, pc: ev.pc });
-                    debug_assert!(arena.contains(p as *const u8));
+                #[inline(always)]
+                fn emit(
+                    o: &mut ParseOut,
+                    arena: &Arena,
+                    pshift: u32,
+                    base: usize,
+                    wref: u32,
+                    ev: Ev,
+                    person: u64,
+                ) {
+                    let p = o.pe[(phash(person) >> pshift) as usize].push_ptr(arena, Pe { person, ts: ev.ts, pc: ev.pc });
                     let r = wref | ((p as usize - base) >> 4) as u32;
-                    o.dk[part_of(ev.eid)].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r });
-                };
-                scan::lines::<7>(&buf, start, end, |f| {
+                    o.dk[(phash(ev.eid) >> pshift) as usize].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r });
+                }
+                scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
                         if ev.ts == NO_TS {
                             o.dk[part_of(ev.eid)].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r: NO_REF });
@@ -624,7 +642,7 @@ fn main() {
                         if rn >= R {
                             let old = ring[slot];
                             let person = lmap.person_h(old.user, rh[slot]);
-                            emit(o, old, person);
+                            emit(o, arena, pshift, base, wref, old, person);
                         }
                         ring[slot] = ev;
                         rh[slot] = h;
@@ -634,14 +652,14 @@ fn main() {
                 for k in rn.saturating_sub(R)..rn {
                     let old = ring[k & (R - 1)];
                     let person = lmap.person_h(old.user, rh[k & (R - 1)]);
-                    emit(o, old, person);
+                    emit(o, arena, pshift, base, wref, old, person);
                 }
             }
             Kind::Click => {
                 let mut ring = [Ck { user: 0, click: 0, ts: 0, camp: 0 }; R];
                 let mut rh = [0u64; R];
                 let mut rn = 0usize;
-                scan::lines::<4>(&buf, start, end, |f| {
+                scan::lines::<4>(&buf, start, end, #[inline(always)] |f| {
                     if f[0].is_empty() || f[1].is_empty() {
                         return;
                     }
@@ -1042,9 +1060,25 @@ fn validate(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ingest: i64) -> Optio
     if t < ctx.ws || t >= ctx.we {
         return None;
     }
-    let price = match f[4] {
-        b"view" | b"cart" => 0,
-        b"purchase" => parse_price(f[6])?,
+    // event type by length + one integer compare (a slice `match` compiles to a memcmp call per line)
+    let ty = f[4];
+    let price = match ty.len() {
+        4 => {
+            let w = u32::from_le_bytes([ty[0], ty[1], ty[2], ty[3]]);
+            if w == u32::from_le_bytes(*b"view") || w == u32::from_le_bytes(*b"cart") {
+                0
+            } else {
+                return None;
+            }
+        }
+        8 => {
+            let w = u64::from_le_bytes([ty[0], ty[1], ty[2], ty[3], ty[4], ty[5], ty[6], ty[7]]);
+            if w == u64::from_le_bytes(*b"purchase") {
+                parse_price(f[6])?
+            } else {
+                return None;
+            }
+        }
         _ => return None,
     };
     if ingest - t > DAY {
