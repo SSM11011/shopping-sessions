@@ -7,3 +7,4 @@ target/
 .venv/
 __pycache__/
 tools-generator/target/
+out*/
