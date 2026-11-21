@@ -45,6 +45,12 @@ struct Pe {
     pc: u32,
 }
 
+/// Partition hash: Fibonacci hashing, high bits are well mixed. Partition = top bits, bucket = next bits.
+#[inline(always)]
+fn phash(k: u64) -> u64 {
+    k.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline(always)]
 fn price_of(pc: u32) -> u32 {
     pc & 0xFF_FFFF
@@ -292,7 +298,7 @@ fn main() {
     let est_rows = ev_bytes / 78 + 1;
     let nparts = (est_rows / 12_000).next_power_of_two().clamp(16, 4096);
     let pshift = 64 - nparts.trailing_zeros();
-    let part_of = |k: u64| (hash(k) >> pshift) as usize;
+    let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     let arenas: Vec<Arena> = (0..threads).map(|_| Arena::new(arena_bytes)).collect();
@@ -545,7 +551,7 @@ fn main() {
         let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(12);
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
-        let bucket = |k: u64| (hash(k) >> sh) as usize & bmask;
+        let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
         radix_events(st2.iter().map(|s| &s.pe[t]), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
         bucket_scatter(ck_parts.iter().map(|v| &v[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
