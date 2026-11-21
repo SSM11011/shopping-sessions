@@ -99,6 +99,18 @@ impl Arena {
         (p as usize) >= b && (p as usize) < b + self.cap
     }
 
+    /// A BLOCK-sized, BLOCK-aligned block (alignment lets `Parts` detect a full block from the cursor alone).
+    fn block_aligned(&self) -> *mut u8 {
+        let at = (self.used.load(Relaxed) + BLOCK - 1) & !(BLOCK - 1);
+        if at + BLOCK <= self.cap {
+            self.used.store(at + BLOCK, Relaxed);
+            unsafe { self.base.add(at) }
+        } else {
+            let layout = std::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
+            unsafe { std::alloc::alloc(layout) }
+        }
+    }
+
     fn block(&self) -> *mut u8 {
         match unsafe { (*self.free.get()).pop() } {
             Some(p) => p,
@@ -233,3 +245,78 @@ unsafe fn prefetch_ahead(p: *const u8) {
 }
 
 const PF_DIST: usize = 256;
+
+/// Many append-only lists (one per partition) with the hot write state packed densely: one cursor per
+/// list, 8 bytes, so a thread's cursors for all partitions stay in L1. Blocks are BLOCK-aligned, so a
+/// cursor sitting on a block boundary means "full" (or "no block yet"). size_of::<T>() must divide BLOCK.
+pub struct Parts<T: Copy> {
+    curs: Vec<*mut T>,
+    lists: Vec<Vec<*mut T>>,
+}
+
+unsafe impl<T: Copy + Send> Send for Parts<T> {}
+unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
+
+impl<T: Copy> Default for Parts<T> {
+    fn default() -> Self {
+        Parts { curs: Vec::new(), lists: Vec::new() }
+    }
+}
+
+impl<T: Copy> Parts<T> {
+    const PER: usize = BLOCK / std::mem::size_of::<T>();
+
+    pub fn new(n: usize, rows_each: usize) -> Self {
+        assert!(BLOCK % std::mem::size_of::<T>() == 0);
+        let cap = rows_each * std::mem::size_of::<T>() / BLOCK + 2;
+        Parts { curs: vec![std::ptr::null_mut(); n], lists: (0..n).map(|_| Vec::with_capacity(cap)).collect() }
+    }
+
+    #[inline(always)]
+    pub fn push_ptr(&mut self, arena: &Arena, part: usize, v: T) -> *mut T {
+        let mut c = unsafe { *self.curs.get_unchecked(part) };
+        if (c as usize) & (BLOCK - 1) == 0 {
+            c = self.grow(arena, part);
+        }
+        unsafe {
+            prefetch_ahead(c as *const u8);
+            c.write(v);
+            *self.curs.get_unchecked_mut(part) = c.add(1);
+        }
+        c
+    }
+
+    #[inline(always)]
+    pub fn push(&mut self, arena: &Arena, part: usize, v: T) {
+        self.push_ptr(arena, part, v);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn grow(&mut self, arena: &Arena, part: usize) -> *mut T {
+        let b = arena.block_aligned() as *mut T;
+        self.lists[part].push(b);
+        b
+    }
+
+    pub fn len(&self, part: usize) -> usize {
+        let l = &self.lists[part];
+        match l.last() {
+            None => 0,
+            Some(&last) => (l.len() - 1) * Self::PER + (self.curs[part] as usize - last as usize) / std::mem::size_of::<T>(),
+        }
+    }
+
+    pub fn for_each_slice(&self, part: usize, mut f: impl FnMut(&[T])) {
+        let l = &self.lists[part];
+        let n = l.len();
+        for (i, &b) in l.iter().enumerate() {
+            let len = if i + 1 == n {
+                (self.curs[part] as usize - b as usize) / std::mem::size_of::<T>()
+            } else {
+                Self::PER
+            };
+            f(unsafe { std::slice::from_raw_parts(b, len) });
+        }
+    }
+}

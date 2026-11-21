@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use arena::{Arena, Blocks, BLOCK};
+use arena::{Arena, Blocks, Parts, BLOCK};
 use keys::{cmp_key, hash, key};
 use ts::DAY;
 
@@ -67,8 +67,9 @@ fn price_of(pc: u32) -> u32 {
     pc & 0xFF_FFFF
 }
 
-/// A valid click. `user` becomes the person after link resolution.
+/// A valid click. `user` becomes the person after link resolution. 32 bytes (divides BLOCK).
 #[derive(Clone, Copy)]
+#[repr(C, align(32))]
 struct Ck {
     user: u64,
     click: u64,
@@ -375,10 +376,10 @@ struct Task {
 struct ParseOut {
     buf: Vec<u8>,
     /// dedup keys, by event_id partition
-    dk: Vec<Blocks<Dk>>,
+    dk: Parts<Dk>,
     /// payload rows, by person partition
-    pe: Vec<Blocks<Pe>>,
-    ck: Vec<Blocks<Ck>>,
+    pe: Parts<Pe>,
+    ck: Parts<Ck>,
     links: Vec<(u64, u64)>,
     tsf: ts::Fast,
 }
@@ -515,9 +516,9 @@ fn main() {
         .map(|_| {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
-                dk: (0..nparts).map(|_| Blocks::with_rows(est_rows * 5 / 4 / nparts / threads)).collect(),
-                pe: (0..nparts).map(|_| Blocks::with_rows(est_rows * 5 / 4 / nparts / threads)).collect(),
-                ck: (0..nparts).map(|_| Blocks::with_rows(est_clicks * 5 / 4 / nparts / threads)).collect(),
+                dk: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
+                pe: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
+                ck: Parts::new(nparts, est_clicks * 5 / 4 / nparts / threads),
                 links: Vec::new(),
                 tsf: ts::Fast::default(),
             })
@@ -623,14 +624,14 @@ fn main() {
                     ev: Ev,
                     person: u64,
                 ) {
-                    let p = o.pe[(phash(person) >> pshift) as usize].push_ptr(arena, Pe { person, ts: ev.ts, pc: ev.pc });
+                    let p = o.pe.push_ptr(arena, (phash(person) >> pshift) as usize, Pe { person, ts: ev.ts, pc: ev.pc });
                     let r = wref | ((p as usize - base) >> 4) as u32;
-                    o.dk[(phash(ev.eid) >> pshift) as usize].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r });
+                    o.dk.push(arena, (phash(ev.eid) >> pshift) as usize, Dk { eid: ev.eid, ingest: ev.ingest, r });
                 }
                 scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
                         if ev.ts == NO_TS {
-                            o.dk[part_of(ev.eid)].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r: NO_REF });
+                            o.dk.push(arena, part_of(ev.eid), Dk { eid: ev.eid, ingest: ev.ingest, r: NO_REF });
                             return;
                         }
                         let h = hash(ev.user);
@@ -683,7 +684,7 @@ fn main() {
                     if rn >= R {
                         let mut old = ring[slot];
                         old.user = lmap.person_h(old.user, rh[slot]);
-                        o.ck[part_of(old.user)].push(arena, old);
+                        o.ck.push(arena, part_of(old.user), old);
                     }
                     ring[slot] = c;
                     rh[slot] = h;
@@ -692,7 +693,7 @@ fn main() {
                 for k in rn.saturating_sub(R)..rn {
                     let mut old = ring[k & (R - 1)];
                     old.user = lmap.person_h(old.user, rh[k & (R - 1)]);
-                    o.ck[part_of(old.user)].push(arena, old);
+                    o.ck.push(arena, part_of(old.user), old);
                 }
             }
             Kind::Link => unreachable!(),
@@ -708,9 +709,9 @@ fn main() {
     // ---- dedup per event_id partition over 16-byte keys only. Earliest ingest wins (equal ingest =>
     // identical copies, keep the first seen); every other copy's payload row is marked dead in place, and
     // an invalid winner simply has no payload. Unique events (the vast majority) write nothing.
-    let ck_parts: Vec<Vec<Blocks<Ck>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
-    let dk_in: Vec<Vec<Blocks<Dk>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dk)).collect();
-    let pe_src: Vec<Vec<Blocks<Pe>>> = outs.into_iter().map(|o| o.pe).collect();
+    let ck_parts: Vec<Parts<Ck>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
+    let dk_in: Vec<Parts<Dk>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dk)).collect();
+    let pe_src: Vec<Parts<Pe>> = outs.into_iter().map(|o| o.pe).collect();
     let bases: Vec<usize> = arenas.iter().map(|a| a.base() as usize).collect();
     let kill = |r: u32| {
         if r != NO_REF {
@@ -733,7 +734,7 @@ fn main() {
         let mut segs: Vec<(*const Dk, usize)> = std::mem::take(&mut st.segs);
         segs.clear();
         for src in &dk_in {
-            src[t].for_each_slice(|sl| segs.push((sl.as_ptr(), sl.len())));
+            src.for_each_slice(t, |sl| segs.push((sl.as_ptr(), sl.len())));
         }
         assert!(segs.len() < (1 << 14), "dedup partition too large for 24-bit row index");
         let n: usize = segs.iter().map(|x| x.1).sum();
@@ -792,7 +793,7 @@ fn main() {
     let results: Vec<Mutex<WorkerOut>> =
         (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp, est_rows / 8 / threads + 1024))).collect();
     let mut order: Vec<(usize, usize)> =
-        (0..nparts).map(|t| (pe_src.iter().map(|s| s[t].len()).sum::<usize>(), t)).collect();
+        (0..nparts).map(|t| (pe_src.iter().map(|s| s.len(t)).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let ud_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&ud_dir).expect("mkdir");
@@ -806,13 +807,13 @@ fn main() {
         let mut cb = std::mem::take(&mut wo.cb);
         // bucket by the next hash bits below the partition bits: persons almost never share a bucket,
         // so each bucket needs only a tiny sort by (person, ts)
-        let n_ev: usize = pe_src.iter().map(|s| s[t].len()).sum();
+        let n_ev: usize = pe_src.iter().map(|s| s.len(t)).sum();
         let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(12);
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
-        radix_events(pe_src.iter().map(|s| &s[t]), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
-        bucket_scatter(ck_parts.iter().map(|v| &v[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
+        radix_events(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+        bucket_scatter(ck_parts.iter().map(|v| (v, t)), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
             if ev.is_empty() {
@@ -901,7 +902,7 @@ fn main() {
 /// Partition events -> `out` ordered by (bucket, ts): LSD radix on ts (11+11+10 bits) then a stable
 /// pass on the bucket. One read of the blocks builds all four histograms.
 fn radix_events<'a>(
-    srcs: impl Iterator<Item = &'a Blocks<Pe>> + Clone,
+    srcs: impl Iterator<Item = (&'a Parts<Pe>, usize)> + Clone,
     n: usize,
     bucket: &impl Fn(u64) -> usize,
     nb: usize,
@@ -919,8 +920,8 @@ fn radix_events<'a>(
     tmp.clear();
     tmp.reserve(n);
     let mut live = 0usize;
-    for b in srcs.clone() {
-        b.for_each_slice(|sl| {
+    for (b, bt) in srcs.clone() {
+        b.for_each_slice(bt, |sl| {
             for e in sl {
                 let ts = e.ts;
                 if ts == NO_TS {
@@ -952,8 +953,8 @@ fn radix_events<'a>(
     unsafe {
         let o = out.as_mut_ptr();
         let t = tmp.as_mut_ptr();
-        for b in srcs {
-            b.for_each_slice(|sl| {
+        for (b, bt) in srcs {
+            b.for_each_slice(bt, |sl| {
                 for e in sl {
                     if e.ts == NO_TS {
                         continue;
@@ -988,7 +989,7 @@ fn radix_events<'a>(
 }
 
 fn bucket_scatter<'a, T: Copy + 'a>(
-    srcs: impl Iterator<Item = &'a Blocks<T>> + Clone,
+    srcs: impl Iterator<Item = (&'a Parts<T>, usize)> + Clone,
     key: impl Fn(&T) -> usize,
     nb: usize,
     starts: &mut Vec<u32>,
@@ -997,8 +998,8 @@ fn bucket_scatter<'a, T: Copy + 'a>(
     starts.clear();
     starts.resize(nb + 1, 0);
     let mut n = 0usize;
-    for b in srcs.clone() {
-        b.for_each_slice(|sl| {
+    for (b, bt) in srcs.clone() {
+        b.for_each_slice(bt, |sl| {
             n += sl.len();
             for e in sl {
                 starts[key(e) + 1] += 1;
@@ -1012,8 +1013,8 @@ fn bucket_scatter<'a, T: Copy + 'a>(
     out.reserve(n);
     let dst = out.as_mut_ptr();
     let mut pos: Vec<u32> = starts[..nb].to_vec();
-    for b in srcs {
-        b.for_each_slice(|sl| {
+    for (b, bt) in srcs {
+        b.for_each_slice(bt, |sl| {
             for e in sl {
                 let k = key(e);
                 unsafe { *dst.add(pos[k] as usize) = *e };
