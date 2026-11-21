@@ -96,30 +96,97 @@ impl Uf {
     }
 }
 
-/// Read-only key -> person name map, slots aligned with the Uf table.
+/// Read-only key -> person name map holding only IDs whose name differs from themselves, behind a
+/// one-word-per-key Bloom filter: unlinked IDs and component roots (the common case) skip the table.
 pub struct LinkMap {
     mask: usize,
-    pub slots: Vec<(u64, u64)>,
+    slots: Vec<(u64, u64)>,
+    bloom: Vec<u64>,
+    bmask: usize,
+}
+
+#[inline(always)]
+fn bloom_bits(h: u64) -> u64 {
+    (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
 }
 
 impl LinkMap {
-    pub fn empty(cap: usize) -> Self {
-        LinkMap { mask: cap - 1, slots: vec![(EMPTY, 0); cap] }
+    /// Builds from a finished Uf. `par` runs closures over index ranges in parallel.
+    pub fn build(uf: &Uf, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Self {
+        let cap_in = uf.cap();
+        // count non-roots
+        let per = 1 << 16;
+        let ntask = cap_in.div_ceil(per);
+        let counts: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(0)).collect();
+        par(ntask, &|t| {
+            let mut c = 0;
+            for i in t * per..((t + 1) * per).min(cap_in) {
+                if let Some((k, name)) = uf.resolved(i) {
+                    if k != name {
+                        c += 1;
+                    }
+                }
+            }
+            counts[t].store(c, Relaxed);
+        });
+        let n: usize = counts.iter().map(|c| c.load(Relaxed) as usize).sum();
+        let cap = (n * 2 + 1).next_power_of_two().max(64);
+        let keys: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(EMPTY)).collect();
+        let vals: Vec<AtomicU64> = (0..cap).map(|_| AtomicU64::new(0)).collect();
+        let bwords = (n * 10 / 64 + 1).next_power_of_two().max(64);
+        let bloom: Vec<AtomicU64> = (0..bwords).map(|_| AtomicU64::new(0)).collect();
+        let mask = cap - 1;
+        let bmask = bwords - 1;
+        par(ntask, &|t| {
+            for i in t * per..((t + 1) * per).min(cap_in) {
+                let Some((k, name)) = uf.resolved(i) else { continue };
+                if k == name {
+                    continue;
+                }
+                let h = hash(k);
+                bloom[(h >> 40) as usize & bmask].fetch_or(bloom_bits(h), Relaxed);
+                let mut j = h as usize & mask;
+                loop {
+                    if keys[j].compare_exchange(EMPTY, k, Relaxed, Relaxed).is_ok() {
+                        vals[j].store(name, Relaxed);
+                        break;
+                    }
+                    j = (j + 1) & mask;
+                }
+            }
+        });
+        LinkMap {
+            mask,
+            slots: keys.into_iter().zip(vals).map(|(k, v)| (k.into_inner(), v.into_inner())).collect(),
+            bloom: bloom.into_iter().map(|b| b.into_inner()).collect(),
+            bmask,
+        }
     }
+
     #[inline(always)]
     pub fn prefetch(&self, k: u64) {
-        let i = hash(k) as usize & self.mask;
+        let h = hash(k);
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
-            _mm_prefetch(self.slots.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+            let w = *self.bloom.get_unchecked((h >> 40) as usize & self.bmask);
+            let b = bloom_bits(h);
+            if w & b == b {
+                _mm_prefetch(self.slots.as_ptr().add(h as usize & self.mask) as *const i8, _MM_HINT_T0);
+            }
         }
     }
+
     #[inline(always)]
     pub fn person(&self, k: u64) -> u64 {
-        let mut i = hash(k) as usize & self.mask;
+        let h = hash(k);
+        let b = bloom_bits(h);
+        if unsafe { *self.bloom.get_unchecked((h >> 40) as usize & self.bmask) } & b != b {
+            return k;
+        }
+        let mut i = h as usize & self.mask;
         loop {
-            let (s, v) = self.slots[i];
+            let (s, v) = unsafe { *self.slots.get_unchecked(i) };
             if s == k {
                 return v;
             }

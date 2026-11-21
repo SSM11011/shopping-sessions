@@ -189,7 +189,7 @@ struct Task {
 struct ParseOut {
     buf: Vec<u8>,
     ev: Vec<Blocks<Ev>>,
-    ck: Blocks<Ck>,
+    ck: Vec<Blocks<Ck>>,
     links: Vec<(u64, u64)>,
     tsf: ts::Fast,
 }
@@ -297,7 +297,7 @@ fn main() {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
                 ev: (0..nparts).map(|_| Blocks::new(BLOCK)).collect(),
-                ck: Blocks::new(1 << 20),
+                ck: (0..nparts).map(|_| Blocks::new(BLOCK / 2)).collect(),
                 links: Vec::new(),
                 tsf: ts::Fast::default(),
             })
@@ -309,56 +309,28 @@ fn main() {
         return;
     }
 
-    run_parallel(threads, tasks.len(), |w, t| {
-        let task = &tasks[t];
+    // ---- phase A: links (small) -> lock-free union-find; root = byte-wise smallest ID = person name
+    let link_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind == Kind::Link).collect();
+    run_parallel(threads, link_tasks.len(), |w, t| {
+        let task = link_tasks[t];
         let (file, flen) = &files[task.file];
-        let arena = &arenas[w];
         let mut guard = outs[w].lock().unwrap();
         let o = &mut *guard;
         let mut buf = std::mem::take(&mut o.buf);
         let (start, end) = scan::load(file, *flen, task.s, task.e, &mut buf);
-        match task.kind {
-            Kind::Event => scan::lines::<7>(&buf, start, end, |f| {
-                if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
-                    o.ev[part_of(ev.eid)].push(arena, ev);
-                }
-            }),
-            Kind::Click => scan::lines::<4>(&buf, start, end, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                let Some(camp) = ctx.campaigns.get(f[2]) else { return };
-                let Some(t) = o.tsf.parse(f[3]) else { return };
-                if t < ws - WEEK || t >= we {
-                    return;
-                }
-                o.ck.push(arena, Ck {
-                    user: unsafe { keys::key_padded(f[1]) },
-                    click: unsafe { keys::key_padded(f[0]) },
-                    ts: (t - (ws - WEEK)) as u32,
-                    camp,
-                });
-            }),
-            Kind::Link => scan::lines::<2>(&buf, start, end, |f| {
-                if f[0].is_empty() || f[1].is_empty() {
-                    return;
-                }
-                o.links.push(unsafe { (keys::key_padded(f[0]), keys::key_padded(f[1])) });
-            }),
-        }
+        scan::lines::<2>(&buf, start, end, |f| {
+            if f[0].is_empty() || f[1].is_empty() {
+                return;
+            }
+            o.links.push(unsafe { (keys::key_padded(f[0]), keys::key_padded(f[1])) });
+        });
         o.buf = buf;
     });
-    let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
-    for o in &mut outs {
-        o.buf = Vec::new();
-    }
-    timing(t0, "parse");
-
-    // ---- links: parallel lock-free union-find; root = byte-wise smallest ID = person name
-    let n_links: usize = outs.iter().map(|o| o.links.len()).sum();
+    let n_links: usize = outs.iter().map(|o| o.lock().unwrap().links.len()).sum();
     let uf = uf::Uf::new(2 * n_links);
     {
-        let link_vecs: Vec<&Vec<(u64, u64)>> = outs.iter().map(|o| &o.links).collect();
+        let guards: Vec<_> = outs.iter().map(|o| o.lock().unwrap()).collect();
+        let link_vecs: Vec<&Vec<(u64, u64)>> = guards.iter().map(|g| &g.links).collect();
         let per = 1 << 14;
         let mut ltasks: Vec<(usize, usize)> = Vec::new();
         for (i, v) in link_vecs.iter().enumerate() {
@@ -376,31 +348,101 @@ fn main() {
             }
         });
     }
-    let cap = uf.cap();
-    let mut lmap = uf::LinkMap::empty(cap);
-    {
-        let per = 1 << 16;
-        let slots = SendPtr(lmap.slots.as_mut_ptr());
-        let uf = &uf;
-        run_parallel(threads, cap.div_ceil(per), |_, t| {
-            let slots = &slots;
-            for i in t * per..((t + 1) * per).min(cap) {
-                if let Some(kv) = uf.resolved(i) {
-                    unsafe { *slots.0.add(i) = kv };
-                }
-            }
-        });
-    }
+    let lmap = uf::LinkMap::build(&uf, &|n, f| run_parallel(threads, n, |_, t| f(t)));
     drop(uf);
-    for o in &mut outs {
-        o.links = Vec::new();
+    for o in &outs {
+        o.lock().unwrap().links = Vec::new();
     }
+    let lmap = &lmap;
     timing(t0, "links");
 
-    // ---- dedup per eid-partition, resolve persons, re-partition by person
+    // ---- phase B: events and clicks. Persons are resolved here, through a small ring so each link-map
+    // miss overlaps with parsing the following lines. Clicks need no dedup: they go straight to person
+    // partitions; events go to event_id partitions for dedup.
+    const R: usize = 16;
+    let main_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind != Kind::Link).collect();
+    run_parallel(threads, main_tasks.len(), |w, t| {
+        let task = main_tasks[t];
+        let (file, flen) = &files[task.file];
+        let arena = &arenas[w];
+        let mut guard = outs[w].lock().unwrap();
+        let o = &mut *guard;
+        let mut buf = std::mem::take(&mut o.buf);
+        let (start, end) = scan::load(file, *flen, task.s, task.e, &mut buf);
+        match task.kind {
+            Kind::Event => {
+                let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, price: 0, cat: 0 }; R];
+                let mut rn = 0usize;
+                scan::lines::<7>(&buf, start, end, |f| {
+                    if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
+                        if ev.ts == NO_TS {
+                            o.ev[part_of(ev.eid)].push(arena, ev);
+                            return;
+                        }
+                        lmap.prefetch(ev.user);
+                        let slot = rn & (R - 1);
+                        if rn >= R {
+                            let mut old = ring[slot];
+                            old.user = lmap.person(old.user);
+                            o.ev[part_of(old.eid)].push(arena, old);
+                        }
+                        ring[slot] = ev;
+                        rn += 1;
+                    }
+                });
+                for k in rn.saturating_sub(R)..rn {
+                    let mut old = ring[k & (R - 1)];
+                    old.user = lmap.person(old.user);
+                    o.ev[part_of(old.eid)].push(arena, old);
+                }
+            }
+            Kind::Click => {
+                let mut ring = [Ck { user: 0, click: 0, ts: 0, camp: 0 }; R];
+                let mut rn = 0usize;
+                scan::lines::<4>(&buf, start, end, |f| {
+                    if f[0].is_empty() || f[1].is_empty() {
+                        return;
+                    }
+                    let Some(camp) = ctx.campaigns.get(f[2]) else { return };
+                    let Some(t) = o.tsf.parse(f[3]) else { return };
+                    if t < ws - WEEK || t >= we {
+                        return;
+                    }
+                    let c = Ck {
+                        user: unsafe { keys::key_padded(f[1]) },
+                        click: unsafe { keys::key_padded(f[0]) },
+                        ts: (t - (ws - WEEK)) as u32,
+                        camp,
+                    };
+                    lmap.prefetch(c.user);
+                    let slot = rn & (R - 1);
+                    if rn >= R {
+                        let mut old = ring[slot];
+                        old.user = lmap.person(old.user);
+                        o.ck[part_of(old.user)].push(arena, old);
+                    }
+                    ring[slot] = c;
+                    rn += 1;
+                });
+                for k in rn.saturating_sub(R)..rn {
+                    let mut old = ring[k & (R - 1)];
+                    old.user = lmap.person(old.user);
+                    o.ck[part_of(old.user)].push(arena, old);
+                }
+            }
+            Kind::Link => unreachable!(),
+        }
+        o.buf = buf;
+    });
+    let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    for o in &mut outs {
+        o.buf = Vec::new();
+    }
+    timing(t0, "parse");
+
+    // ---- dedup per eid-partition, then re-partition survivors by person
     struct Stage2 {
         pe: Vec<Blocks<Pe>>,
-        ck: Vec<Blocks<Ck>>,
         gather: Vec<Ev>,
         table: Vec<u32>,
     }
@@ -408,80 +450,56 @@ fn main() {
         .map(|_| {
             Mutex::new(Stage2 {
                 pe: (0..nparts).map(|_| Blocks::new(BLOCK)).collect(),
-                ck: (0..nparts).map(|_| Blocks::new(BLOCK / 2)).collect(),
                 gather: Vec::new(),
                 table: Vec::new(),
             })
         })
         .collect();
-    let ck_in: Vec<Blocks<Ck>> = outs.iter_mut().map(|o| std::mem::replace(&mut o.ck, Blocks::new(BLOCK))).collect();
+    let ck_parts: Vec<Vec<Blocks<Ck>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
     let ev_in: Vec<Vec<Blocks<Ev>>> = outs.into_iter().map(|o| o.ev).collect();
-    let lmap = &lmap;
-    const PF: usize = 16;
-    run_parallel(threads, nparts + ck_in.len(), |w, t| {
+    run_parallel(threads, nparts, |w, t| {
         let arena = &arenas[w];
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
-        if t < nparts {
-            st.gather.clear();
-            for src in &ev_in {
-                src[t].extend_into(&mut st.gather);
-            }
-            let n = st.gather.len();
-            let cap = (n * 2).next_power_of_two().max(16);
-            let mask = cap - 1;
-            st.table.clear();
-            st.table.resize(cap, u32::MAX);
-            let gather = &st.gather;
-            let table = &mut st.table;
-            for (idx, e) in gather.iter().enumerate() {
-                let mut i = (hash(e.eid) as usize >> 3) & mask;
-                loop {
-                    let s = unsafe { *table.get_unchecked(i) };
-                    if s == u32::MAX {
+        st.gather.clear();
+        for src in &ev_in {
+            src[t].extend_into(&mut st.gather);
+        }
+        let n = st.gather.len();
+        let cap = (n * 2).next_power_of_two().max(16);
+        let mask = cap - 1;
+        st.table.clear();
+        st.table.resize(cap, u32::MAX);
+        let gather = &st.gather;
+        let table = &mut st.table;
+        for (idx, e) in gather.iter().enumerate() {
+            let mut i = (hash(e.eid) as usize >> 3) & mask;
+            loop {
+                let s = unsafe { *table.get_unchecked(i) };
+                if s == u32::MAX {
+                    table[i] = idx as u32;
+                    break;
+                }
+                let o = unsafe { gather.get_unchecked(s as usize) };
+                if o.eid == e.eid {
+                    if e.ingest < o.ingest {
                         table[i] = idx as u32;
-                        break;
                     }
-                    let o = unsafe { gather.get_unchecked(s as usize) };
-                    if o.eid == e.eid {
-                        if e.ingest < o.ingest {
-                            table[i] = idx as u32;
-                        }
-                        break;
-                    }
-                    i = (i + 1) & mask;
+                    break;
                 }
+                i = (i + 1) & mask;
             }
-            // survivors: winners that are valid; prefetch their link slots ahead
-            let mut surv: Vec<u32> = Vec::with_capacity(n);
-            for &s in table.iter() {
-                if s != u32::MAX && gather[s as usize].ts != NO_TS {
-                    surv.push(s);
+        }
+        for &s in table.iter() {
+            if s != u32::MAX {
+                let e = unsafe { gather.get_unchecked(s as usize) };
+                if e.ts != NO_TS {
+                    st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, price: e.price, cat: e.cat });
                 }
-            }
-            for k in 0..surv.len() {
-                if k + PF < surv.len() {
-                    lmap.prefetch(gather[surv[k + PF] as usize].user);
-                }
-                let e = &gather[surv[k] as usize];
-                let person = lmap.person(e.user);
-                st.pe[part_of(person)].push(arena, Pe { person, ts: e.ts, price: e.price, cat: e.cat });
-            }
-        } else {
-            let mut v: Vec<Ck> = Vec::new();
-            ck_in[t - nparts].extend_into(&mut v);
-            for i in 0..v.len() {
-                if i + PF < v.len() {
-                    lmap.prefetch(v[i + PF].user);
-                }
-                let c = &v[i];
-                let person = lmap.person(c.user);
-                st.ck[part_of(person)].push(arena, Ck { user: person, ..*c });
             }
         }
     });
     drop(ev_in);
-    drop(ck_in);
     let st2: Vec<Stage2> = st2.into_iter().map(|m| m.into_inner().unwrap()).collect();
     timing(t0, "dedup");
 
@@ -506,7 +524,7 @@ fn main() {
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (hash(k) >> sh) as usize & bmask;
         bucket_scatter(st2.iter().map(|s| &s.pe[t]), |e: &Pe| bucket(e.person), bmask + 1, &mut eb, &mut evs);
-        bucket_scatter(st2.iter().map(|s| &s.ck[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
+        bucket_scatter(ck_parts.iter().map(|v| &v[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
             if ev.is_empty() {
@@ -601,9 +619,6 @@ fn bucket_scatter<'a, T: Copy + 'a>(
     unsafe { out.set_len(n) };
 }
 
-struct SendPtr<T>(*mut T);
-unsafe impl<T> Sync for SendPtr<T> {}
-unsafe impl<T> Send for SendPtr<T> {}
 
 /// An event line -> dedup candidate (None if the event_id is empty).
 #[inline(always)]
