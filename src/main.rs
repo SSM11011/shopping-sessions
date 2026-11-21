@@ -700,54 +700,68 @@ fn main() {
         }
     };
     struct Stage2 {
-        gather: Vec<Dk>,
-        table: Vec<u32>,
+        segs: Vec<(*const Dk, usize)>,
+        table: Vec<u64>,
     }
+    unsafe impl Send for Stage2 {}
     let st2: Vec<Mutex<Stage2>> =
-        (0..threads).map(|_| Mutex::new(Stage2 { gather: Vec::new(), table: Vec::new() })).collect();
+        (0..threads).map(|_| Mutex::new(Stage2 { segs: Vec::new(), table: Vec::new() })).collect();
     run_parallel(threads, nparts, |w, t| {
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
-        st.gather.clear();
+        // keys stay where parsing put them (index = segment << 10 | offset); slot = 40-bit fingerprint
+        // << 24 | index, so a different event in a slot is rejected without reading its key
+        let mut segs: Vec<(*const Dk, usize)> = std::mem::take(&mut st.segs);
+        segs.clear();
         for src in &dk_in {
-            src[t].extend_into(&mut st.gather);
+            src[t].for_each_slice(|sl| segs.push((sl.as_ptr(), sl.len())));
         }
-        let n = st.gather.len();
+        assert!(segs.len() < (1 << 14), "dedup partition too large for 24-bit row index");
+        let n: usize = segs.iter().map(|x| x.1).sum();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
         st.table.clear();
-        st.table.resize(cap, u32::MAX);
-        let gather = &st.gather;
+        st.table.resize(cap, u64::MAX);
         let table = &mut st.table;
+        let at = |idx: usize| -> &Dk { unsafe { &*segs.get_unchecked(idx >> 10).0.add(idx & 1023) } };
         const DPF: usize = 8;
-        for (idx, e) in gather.iter().enumerate() {
-            if idx + DPF < n {
-                let j = (hash(unsafe { gather.get_unchecked(idx + DPF) }.eid) as usize >> 3) & mask;
-                #[cfg(target_arch = "x86_64")]
-                unsafe {
-                    std::arch::x86_64::_mm_prefetch(table.as_ptr().add(j) as *const i8, std::arch::x86_64::_MM_HINT_T0);
-                }
-            }
-            let mut i = (hash(e.eid) as usize >> 3) & mask;
-            loop {
-                let s = unsafe { *table.get_unchecked(i) };
-                if s == u32::MAX {
-                    table[i] = idx as u32;
-                    break;
-                }
-                let o = unsafe { gather.get_unchecked(s as usize) };
-                if o.eid == e.eid {
-                    if e.ingest < o.ingest {
-                        kill(o.r);
-                        table[i] = idx as u32;
-                    } else {
-                        kill(e.r);
+        for (si, &(p, len)) in segs.iter().enumerate() {
+            let sl = unsafe { std::slice::from_raw_parts(p, len) };
+            for (off, e) in sl.iter().enumerate() {
+                if off + DPF < len {
+                    let j = (hash(unsafe { sl.get_unchecked(off + DPF) }.eid) as usize >> 3) & mask;
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        std::arch::x86_64::_mm_prefetch(table.as_ptr().add(j) as *const i8, std::arch::x86_64::_MM_HINT_T0);
                     }
-                    break;
                 }
-                i = (i + 1) & mask;
+                let idx = (si << 10) | off;
+                let h = hash(e.eid);
+                let fp = (h >> 24) << 24;
+                let mut i = (h as usize >> 3) & mask;
+                loop {
+                    let s = unsafe { *table.get_unchecked(i) };
+                    if s == u64::MAX {
+                        table[i] = fp | idx as u64;
+                        break;
+                    }
+                    if s & !0xFF_FFFF == fp {
+                        let o = at((s & 0xFF_FFFF) as usize);
+                        if o.eid == e.eid {
+                            if e.ingest < o.ingest {
+                                kill(o.r);
+                                table[i] = fp | idx as u64;
+                            } else {
+                                kill(e.r);
+                            }
+                            break;
+                        }
+                    }
+                    i = (i + 1) & mask;
+                }
             }
         }
+        st.segs = segs;
     });
     drop(dk_in);
     timing(t0, "dedup");
