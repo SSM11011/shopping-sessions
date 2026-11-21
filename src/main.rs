@@ -319,7 +319,7 @@ fn main() {
         }
     }
     let est_rows = ev_bytes / 78 + 1;
-    let nparts = (est_rows / 12_000).next_power_of_two().clamp(16, 4096);
+    let nparts = std::env::var("SESSIONS_PARTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (est_rows / 12_000).next_power_of_two().clamp(16, 4096));
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;

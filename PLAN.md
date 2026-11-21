@@ -234,3 +234,22 @@ never submit without the fuzz gate.
 | Click-dedup skip wrong if copies ever differ | Rules guarantee identical; reference does dedup, fuzz will catch it |
 | Final 60M memory | ~32 B/event × 64M ≈ 2 GB + mmap; measured in step 8 |
 | Score noise ±20% | Optimize big-ticket items; don't chase < 5% gains with submissions |
+
+---
+
+## 7. Status log (2026-11-22)
+
+| Version | 20M local (8 thr, 4 cores) | Notes |
+|---|---|---|
+| First correct Rust | 1.80 s | std HashMap, mmap, sort-based |
+| AVX2 splitter, THP arenas, L2 dedup | 0.88 s | |
+| SWAR ts/keys, radix sessions, links-first + Bloom map | 0.76 s | |
+| Hand-rolled Parquet, compact records, block recycling | 0.70 s | docker wall 0.77–0.87 s |
+
+Verified: 36/36 fixtures, dev MATCH, ~180 generator seeds (20k–300k), ~800 adversarial seeds
+(`tools/advgen.py`), 3M-event seed vs Python reference: MATCH.
+
+Tried and dropped (no measurable gain): mmap input (sys↓ user↑), PGO, pdep comma extraction,
+branch-free newline extraction (kept, neutral). AVX-512 untestable locally (qemu 6.2 lacks AVX).
+
+Remaining cost (20M): parse ~0.43 s (≈45 ns/line/core), dedup 0.08, sessions 0.11, links 0.04, write 0.03.
