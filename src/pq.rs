@@ -112,12 +112,15 @@ fn page_header(n: usize, size: usize) -> Vec<u8> {
 }
 
 pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<()> {
-    let mut out: Vec<u8> = Vec::with_capacity(64 + rows * 48);
-    out.extend_from_slice(b"PAR1");
+    // pages stream straight to the file through one reused buffer (no whole-file buffer)
+    let mut out = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
+    let mut pos: usize = 0;
+    out.write_all(b"PAR1")?;
+    pos += 4;
     let mut metas = Vec::new();
     let mut page = Vec::new();
     for c in cols {
-        let offset = out.len() as i64;
+        let offset = pos as i64;
         let (ty, optional) = match &c.data {
             Data::Str { present, .. } => (6, present.is_some()),
             Data::I32(_) => (1, false),
@@ -172,8 +175,10 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
                     }
                 }
             }
-            out.extend_from_slice(&page_header(r1 - r0, page.len()));
-            out.extend_from_slice(&page);
+            let ph = page_header(r1 - r0, page.len());
+            out.write_all(&ph)?;
+            out.write_all(&page)?;
+            pos += ph.len() + page.len();
             r0 = r1;
             if rows == 0 {
                 break;
@@ -183,7 +188,7 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
             name: c.name.to_string(),
             ty,
             num_values: rows as i64,
-            size: out.len() as i64 - offset,
+            size: pos as i64 - offset,
             offset,
             optional,
         });
@@ -247,8 +252,8 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
     t.strf(6, "sessions");
     t.buf.push(0);
     let footer = t.buf;
-    out.extend_from_slice(&footer);
-    out.extend_from_slice(&(footer.len() as u32).to_le_bytes());
-    out.extend_from_slice(b"PAR1");
-    File::create(path)?.write_all(&out)
+    out.write_all(&footer)?;
+    out.write_all(&(footer.len() as u32).to_le_bytes())?;
+    out.write_all(b"PAR1")?;
+    out.flush()
 }

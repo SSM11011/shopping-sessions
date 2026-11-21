@@ -771,7 +771,7 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1) as usize;
     let ncol = n_camp + 1; // + organic
     let results: Vec<Mutex<WorkerOut>> =
-        (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp))).collect();
+        (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp, est_rows / 8 / threads + 1024))).collect();
     let mut order: Vec<(usize, usize)> =
         (0..nparts).map(|t| (pe_src.iter().map(|s| s[t].len()).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
@@ -1056,8 +1056,8 @@ pub struct WorkerOut {
     pub names: Vec<u8>,
     pub name_end: Vec<u32>,
     pub day: Vec<i32>,
-    pub sessions: Vec<i64>,
-    pub events: Vec<i64>,
+    pub sessions: Vec<i32>,
+    pub events: Vec<i32>,
     pub revenue: Vec<i64>,
     pub top: Vec<u32>, // u32::MAX = null
     pub camp: Vec<[i64; 4]>,
@@ -1080,15 +1080,16 @@ pub struct WorkerOut {
 }
 
 impl WorkerOut {
-    fn new(cells: usize, n_camp: usize) -> Self {
+    /// `rows`: expected user_daily rows for this worker (pre-sized so the columns never reallocate)
+    fn new(cells: usize, n_camp: usize, rows: usize) -> Self {
         WorkerOut {
-            names: Vec::new(),
-            name_end: Vec::new(),
-            day: Vec::new(),
-            sessions: Vec::new(),
-            events: Vec::new(),
-            revenue: Vec::new(),
-            top: Vec::new(),
+            names: Vec::with_capacity(rows * 10),
+            name_end: Vec::with_capacity(rows),
+            day: Vec::with_capacity(rows),
+            sessions: Vec::with_capacity(rows),
+            events: Vec::with_capacity(rows),
+            revenue: Vec::with_capacity(rows),
+            top: Vec::with_capacity(rows),
             camp: vec![[0; 4]; cells],
             assist: vec![0; cells],
             count: vec![0; n_camp],
@@ -1170,8 +1171,8 @@ fn person_sessions(
         let _ = start;
         wo.name_end.push(wo.names.len() as u32);
         wo.day.push(day as i32);
-        wo.sessions.push(s);
-        wo.events.push(e);
+        wo.sessions.push(s as i32);
+        wo.events.push(e as i32);
         wo.revenue.push(r);
         let mut top = u32::MAX;
         let mut best = 0u64;

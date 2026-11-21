@@ -19,16 +19,14 @@ pub fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>]) {
             te.push(tb.len() as u32);
         }
     }
-    let sessions: Vec<i32> = r.sessions.iter().map(|&x| x as i32).collect();
-    let events: Vec<i32> = r.events.iter().map(|&x| x as i32).collect();
     pq::write(
         path,
         rows,
         &[
             Column { name: "user_id", date: false, data: Data::Str { bytes: &r.names, ends: &r.name_end, present: None } },
             Column { name: "day", date: true, data: Data::I32(&r.day) },
-            Column { name: "sessions", date: false, data: Data::I32(&sessions) },
-            Column { name: "events", date: false, data: Data::I32(&events) },
+            Column { name: "sessions", date: false, data: Data::I32(&r.sessions) },
+            Column { name: "events", date: false, data: Data::I32(&r.events) },
             Column { name: "revenue_cents", date: false, data: Data::I64(&r.revenue) },
             Column { name: "top_category", date: false, data: Data::Str { bytes: &tb, ends: &te, present: Some(&present) } },
         ],
