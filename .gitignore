@@ -1,0 +1,9 @@
+data/
+dev/
+out/
+output/
+scratch/
+target/
+.venv/
+__pycache__/
+tools-generator/target/
