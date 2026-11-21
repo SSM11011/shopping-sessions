@@ -165,11 +165,14 @@ fn validate_extract<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, c: 
         return false;
     }
     let mut fs = 0usize;
-    let mut rest = c;
+    // comma positions from two 64-bit halves (no 128-bit shifts/borrows in the loop)
+    let mut lo = c as u64;
+    let mut hi = (c >> 64) as u64;
     for (i, slot) in fields.iter_mut().enumerate() {
         let fe = if i + 1 < N {
-            let t = rest.trailing_zeros() as usize;
-            rest &= rest.wrapping_sub(1);
+            let in_lo = lo != 0;
+            let t = if in_lo { lo.trailing_zeros() } else { 64 + hi.trailing_zeros() } as usize;
+            if in_lo { lo &= lo - 1 } else { hi &= hi.wrapping_sub(1) }
             t
         } else {
             len
