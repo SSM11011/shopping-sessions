@@ -806,9 +806,26 @@ fn main() {
             }
             let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
             if ck.len() > 1 {
-                ck.sort_unstable_by(|a, b| {
-                    a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| cmp_key(a.click, b.click))
-                });
+                if ck.iter().all(|c| c.click & keys::EXOTIC == 0) {
+                    // canonical click ids compare as integers: one packed 128-bit key (user, ts, click)
+                    ck.sort_unstable_by_key(|c| ((c.user as u128) << 64) | ((c.ts as u128) << 32) | (c.click >> 28) as u128);
+                    // the key above drops the click id's low 28 bits; fix the (rare) equal-prefix ties exactly
+                    let mut i = 0;
+                    while i + 1 < ck.len() {
+                        let mut j = i + 1;
+                        while j < ck.len() && ck[j].user == ck[i].user && ck[j].ts == ck[i].ts && ck[j].click >> 28 == ck[i].click >> 28 {
+                            j += 1;
+                        }
+                        if j - i > 1 {
+                            ck[i..j].sort_unstable_by_key(|c| c.click);
+                        }
+                        i = j;
+                    }
+                } else {
+                    ck.sort_unstable_by(|a, b| {
+                        a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| cmp_key(a.click, b.click))
+                    });
+                }
             }
             let mut ci = 0;
             let mut i = 0;
@@ -998,7 +1015,12 @@ fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> 
     }
     let eid = unsafe { keys::key_padded(f[0]) };
     let (ingest, ing32) = match tsf.parse(f[3]) {
-        Some(v) => (v, (v.div_euclid(1000) - ing_base).clamp(0, u32::MAX as i64 - 1) as u32),
+        Some(v) => {
+            // seconds since ing_base (normal case: v > 0, small offset); exact floor division otherwise
+            let secs = if v >= 0 { v / 1000 } else { v.div_euclid(1000) };
+            let rel = secs - ing_base;
+            (v, if (rel as u64) < u32::MAX as u64 { rel as u32 } else { rel.clamp(0, u32::MAX as i64 - 1) as u32 })
+        }
         None => (i64::MAX, u32::MAX),
     };
     let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, pc: 0 };
