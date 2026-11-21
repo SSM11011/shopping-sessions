@@ -26,6 +26,18 @@ impl Uf {
         self.mask + 1
     }
 
+    /// Prefetch the home slot (key and parent) of `k` ahead of a union.
+    #[inline(always)]
+    pub fn prefetch(&self, k: u64) {
+        let i = hash(k) as usize & self.mask;
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.keys.as_ptr().add(i) as *const i8, _MM_HINT_ET0);
+            _mm_prefetch(self.parent.as_ptr().add(i) as *const i8, _MM_HINT_T0);
+        }
+    }
+
     #[inline]
     fn slot(&self, k: u64) -> usize {
         let mut i = hash(k) as usize & self.mask;
@@ -169,7 +181,18 @@ impl LinkMap {
         // pass 2: insert non-roots (CAS on the key word, plain store of the value)
         par(ntask, &|t| {
             let (sp, bp) = (&sp, &bp);
-            for i in t * per..((t + 1) * per).min(cap_in) {
+            let hi = ((t + 1) * per).min(cap_in);
+            for i in t * per..hi {
+                // prefetch the insert target of a non-root a few slots ahead
+                if i + 16 < hi && names[i + 16] != EMPTY {
+                    let hk = hash(uf.keys[i + 16].load(Relaxed));
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use std::arch::x86_64::*;
+                        _mm_prefetch(sp.0.add(hk as usize & mask) as *const i8, _MM_HINT_ET0);
+                        _mm_prefetch(bp.0.add((hk >> 40) as usize & bmask) as *const i8, _MM_HINT_ET0);
+                    }
+                }
                 let name = names[i];
                 if name == EMPTY {
                     continue;

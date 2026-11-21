@@ -492,7 +492,13 @@ fn main() {
         run_parallel(threads, ltasks.len(), |_, t| {
             let (i, s) = ltasks[t];
             let v = link_vecs[i];
-            for &(a, b) in &v[s..(s + per).min(v.len())] {
+            let sl = &v[s..(s + per).min(v.len())];
+            for (i, &(a, b)) in sl.iter().enumerate() {
+                if i + 8 < sl.len() {
+                    let (pa, pb) = sl[i + 8];
+                    uf.prefetch(pa);
+                    uf.prefetch(pb);
+                }
                 uf.union(a, b);
             }
         });
@@ -971,6 +977,11 @@ pub struct WorkerOut {
     count: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
+    /// per campaign: day index and cum[day] when it became active
+    act_day: Vec<u32>,
+    snap: Vec<u32>,
+    /// sessions counted so far for the current person, per day index
+    cum: Vec<u32>,
     cats: Vec<(u32, u64)>,
     evs: Vec<Pe>,
     cks: Vec<Ck>,
@@ -994,6 +1005,9 @@ impl WorkerOut {
             count: vec![0; n_camp],
             pos: vec![0; n_camp],
             active: Vec::new(),
+            act_day: vec![0; n_camp],
+            snap: vec![0; n_camp],
+            cum: vec![0; cells / (n_camp + 1)],
             cats: Vec::new(),
             evs: Vec::new(),
             cks: Vec::new(),
@@ -1002,25 +1016,44 @@ impl WorkerOut {
             scratch: Vec::new(),
         }
     }
+    /// Campaign c gains a click in the window just before the session on day `day` is counted.
     #[inline]
-    fn add(&mut self, c: u32) {
+    fn add(&mut self, c: u32, day: usize) {
         let c = c as usize;
         if self.count[c] == 0 {
             self.pos[c] = self.active.len() as u32;
             self.active.push(c as u32);
+            self.act_day[c] = day as u32;
+            self.snap[c] = self.cum[day];
         }
         self.count[c] += 1;
     }
+    /// Campaign c loses a click; `last` = day index of the last counted session (or usize::MAX for none).
     #[inline]
-    fn remove(&mut self, c: u32) {
+    fn remove(&mut self, c: u32, last: usize, ndays: usize) {
         let c = c as usize;
         self.count[c] -= 1;
         if self.count[c] == 0 {
+            self.close(c, last, ndays);
             let p = self.pos[c] as usize;
-            let last = *self.active.last().unwrap();
-            self.active[p] = last;
-            self.pos[last as usize] = p as u32;
+            let l = *self.active.last().unwrap();
+            self.active[p] = l;
+            self.pos[l as usize] = p as u32;
             self.active.pop();
+        }
+    }
+    /// Credit campaign c with every session counted while it was active.
+    #[inline]
+    fn close(&mut self, c: usize, last: usize, ndays: usize) {
+        if last == usize::MAX {
+            return;
+        }
+        let a = self.act_day[c] as usize;
+        let mut d = a;
+        while d <= last {
+            let n = self.cum[d] - if d == a { self.snap[c] } else { 0 };
+            self.assist[c * ndays + d] += n;
+            d += 1;
         }
     }
 }
@@ -1038,6 +1071,7 @@ fn person_sessions(
 ) {
     let week = WEEK as u32;
     let (mut lo, mut hi) = (0usize, 0usize);
+    let (mut first_day, mut last_day) = (usize::MAX, usize::MAX);
     // current (person, day) accumulator
     let (mut a_sess, mut a_ev, mut a_rev) = (0i64, 0i64, 0i64);
     wo.cats.clear();
@@ -1090,11 +1124,11 @@ fn person_sessions(
         // attribution: clicks in click-relative coords; session start s_c = start + week
         let s_c = start + week;
         while hi < cks.len() && cks[hi].ts <= s_c {
-            wo.add(cks[hi].camp);
+            wo.add(cks[hi].camp, di);
             hi += 1;
         }
         while lo < hi && cks[lo].ts < start {
-            wo.remove(cks[lo].camp);
+            wo.remove(cks[lo].camp, last_day, ndays);
             lo += 1;
         }
         let credit = if lo < hi {
@@ -1111,10 +1145,12 @@ fn person_sessions(
         cell[0] += 1;
         cell[1] += purchased as i64;
         cell[2] += rev;
-        for idx in 0..wo.active.len() {
-            let c = wo.active[idx] as usize;
-            wo.assist[c * ndays + di] += 1;
+        // count this session; active campaigns are credited in bulk when they deactivate
+        wo.cum[di] += 1;
+        if first_day == usize::MAX {
+            first_day = di;
         }
+        last_day = di;
         // user_daily: sessions are in start order, so a day's sessions are contiguous; flush when the next
         // session starts on another day (cats already hold only this day's purchases).
         a_sess += 1;
@@ -1130,8 +1166,13 @@ fn person_sessions(
         i = j;
     }
     while lo < hi {
-        wo.remove(cks[lo].camp);
+        wo.remove(cks[lo].camp, last_day, ndays);
         lo += 1;
+    }
+    if first_day != usize::MAX {
+        for d in first_day..=last_day {
+            wo.cum[d] = 0;
+        }
     }
 }
 
