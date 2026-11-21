@@ -338,3 +338,29 @@ pub fn bench_nl(buf: &[u8], start: usize, end: usize) -> u64 {
     }
     acc
 }
+
+/// micro: masks + validation only (returns count of valid lines)
+pub fn bench_validate<const N: usize>(buf: &[u8], start: usize, end: usize) -> u64 {
+    let p = buf.as_ptr();
+    let mut acc = 0u64;
+    let mut s = start;
+    for e in memchr::memchr_iter(b'\n', &buf[start..end]) {
+        let e = start + e;
+        let len = e - s;
+        if len < 127 {
+            let (_, c0, q0) = unsafe { masks64(p.add(s)) };
+            let (_, c1, q1) = unsafe { masks64(p.add(s + 64)) };
+            let lm: u128 = (1u128 << len) - 1;
+            let c = (c0 as u128 | ((c1 as u128) << 64)) & lm;
+            let q = (q0 as u128 | ((q1 as u128) << 64)) & lm;
+            let starts = (c << 1) | 1;
+            let lasts = (c | (1u128 << len)) >> 1;
+            let a = q & starts;
+            let b = q & lasts;
+            let bad = (q ^ (a | b)) | (a & b) | (b.wrapping_sub(a) & (c | lasts));
+            acc += (bad == 0 && c.count_ones() as usize == N - 1) as u64;
+        }
+        s = e + 1;
+    }
+    acc
+}

@@ -33,7 +33,9 @@ impl Arena {
             if p == libc::MAP_FAILED {
                 return Arena { base: std::ptr::null_mut(), cap: 0, used: AtomicUsize::new(0), free: Default::default() };
             }
-            libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+            if std::env::var_os("SESSIONS_NOTHP").is_none() {
+                libc::madvise(p, cap, libc::MADV_HUGEPAGE);
+            }
             Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), free: Default::default() }
         }
     }

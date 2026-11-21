@@ -319,7 +319,7 @@ fn main() {
         }
     }
     let est_rows = ev_bytes / 78 + 1;
-    let nparts = std::env::var("SESSIONS_PARTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (est_rows / 12_000).next_power_of_two().clamp(16, 4096));
+    let nparts = std::env::var("SESSIONS_PARTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (est_rows / 24_000).next_power_of_two().clamp(16, 4096));
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
@@ -1007,6 +1007,7 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     run("newlines", &|| memchr::memchr_iter(b'\n', &buf[start..end]).count() as u64);
     run("nl-chain", &|| scan::bench_nl(&buf, start, end));
     run("masks", &|| scan::bench_masks(&buf, start, end));
+    run("validate7", &|| scan::bench_validate::<7>(&buf, start, end));
     run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += f[0].len() as u64); c });
     run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
     run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
