@@ -302,6 +302,10 @@ fn main() {
         })
         .collect();
     timing(t0, "setup");
+    if std::env::var_os("EXP_MICRO").is_some() {
+        micro(&files, &ctx);
+        return;
+    }
 
     run_parallel(threads, tasks.len(), |w, t| {
         let task = &tasks[t];
@@ -758,4 +762,30 @@ fn person_sessions(
         wo.remove(cks[lo].camp);
         lo += 1;
     }
+}
+
+fn micro(files: &[(File, usize)], ctx: &Ctx) {
+    let (f, len) = &files.iter().max_by_key(|x| x.1).unwrap();
+    let mut buf = Vec::new();
+    let (start, end) = scan::load(f, *len, 0, *len, &mut buf);
+    let n = buf[start..end].iter().filter(|&&b| b == b'\n').count();
+    let run = |name: &str, g: &dyn Fn() -> u64| {
+        let mut best = f64::MAX;
+        let mut r = 0;
+        for _ in 0..7 {
+            let t = Instant::now();
+            r += g();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{name:>10}: {:5.1} ns/line ({})", best * 1e9 / n as f64, r % 7);
+    };
+    run("newlines", &|| memchr::memchr_iter(b'\n', &buf[start..end]).count() as u64);
+    run("nl-chain", &|| scan::bench_nl(&buf, start, end));
+    run("masks", &|| scan::bench_masks(&buf, start, end));
+    run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += f[0].len() as u64); c });
+    run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
+    run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
+    run("ts", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64)); c });
+    run("product", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += ctx.products.get(f[5]).unwrap_or(0) as u64); c });
+    run("validate", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, f, 0).map_or(0, |v| v.0 as u64)); c });
 }

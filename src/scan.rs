@@ -116,77 +116,115 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (n, c, q)
 }
 
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+unsafe fn nl64(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe {
+        let n = _mm256_set1_epi8(b'\n' as i8);
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        (_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, n)) as u32) as u64
+            | ((_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, n)) as u32 as u64) << 32)
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn nl64(p: *const u8) -> u64 {
+    unsafe { masks64(p).0 }
+}
+
+/// Splits one line [s, e) (e - s < 127) into N fields; false if malformed.
+///
+/// Quote rule, branch-free: with C = commas, Q = quotes, S = field starts, L = field last bytes,
+/// A = Q&S, B = Q&L, a line is well-quoted iff Q == A|B, A&B == 0 (no 1-byte `"` field) and
+/// (B - A) & (C|L) == 0: each opening quote's borrow must stop exactly at its own field's last byte.
+#[inline(always)]
+fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: &mut [&'a [u8]; N]) -> bool {
+    let p = buf.as_ptr();
+    let (_, c0, q0) = unsafe { masks64(p.add(s)) };
+    let (_, c1, q1) = unsafe { masks64(p.add(s + 64)) };
+    let lm: u128 = (1u128 << len) - 1;
+    let c = (c0 as u128 | ((c1 as u128) << 64)) & lm;
+    let q = (q0 as u128 | ((q1 as u128) << 64)) & lm;
+    if c.count_ones() as usize != N - 1 || len == 0 {
+        return false;
+    }
+    let starts = (c << 1) | 1;
+    let lasts = (c | (1u128 << len)) >> 1;
+    let a_mask = q & starts;
+    let b = q & lasts;
+    if (q ^ (a_mask | b)) | (a_mask & b) | (b.wrapping_sub(a_mask) & (c | lasts)) != 0 {
+        return false;
+    }
+    let mut fs = 0usize;
+    let mut rest = c;
+    for (i, slot) in fields.iter_mut().enumerate() {
+        let fe = if i + 1 < N {
+            let t = rest.trailing_zeros() as usize;
+            rest &= rest.wrapping_sub(1);
+            t
+        } else {
+            len
+        };
+        let qd = ((a_mask >> fs) & 1) as usize;
+        *slot = unsafe { buf.get_unchecked(s + fs + qd..s + fe - qd) };
+        fs = fe + 1;
+    }
+    true
+}
+
+#[inline(always)]
+fn one_line<'a, const N: usize>(
+    buf: &'a [u8],
+    s: usize,
+    e: usize,
+    fields: &mut [&'a [u8]; N],
+    f: &mut impl FnMut(&[&'a [u8]; N]),
+) {
+    let len = e - s;
+    let ok = if len < 127 { split_short(buf, s, len, fields) } else { split(&buf[s..e], fields) };
+    if ok {
+        f(fields);
+    }
+}
+
 /// Calls `f` with the N fields of every well-formed line starting in buf[start..end).
-/// Requires buf.len() >= end + PAD and buf[end..end+PAD] zeroed.
+/// Requires buf.len() >= end + PAD and buf[end..end+PAD] zeroed. Newlines are indexed in batches first
+/// so that the per-line work has no serial dependency and pipelines.
 #[inline(always)]
 pub fn lines<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     debug_assert!(buf.len() >= end + PAD);
     let p = buf.as_ptr();
-    let mut at = start;
     let mut fields: [&'a [u8]; N] = [&buf[0..0]; N];
-    while at < end {
-        let (n0, c0, q0) = unsafe { masks64(p.add(at)) };
-        let (len, cm, qt): (usize, u128, u128);
-        if n0 != 0 {
-            len = n0.trailing_zeros() as usize;
-            cm = c0 as u128;
-            qt = q0 as u128;
-        } else {
-            let (n1, c1, q1) = unsafe { masks64(p.add(at + 64)) };
-            if n1 != 0 {
-                len = 64 + n1.trailing_zeros() as usize;
-                cm = c0 as u128 | ((c1 as u128) << 64);
-                qt = q0 as u128 | ((q1 as u128) << 64);
-            } else {
-                // long line (or one running into the zero padding at the very end)
-                let nl = match memchr::memchr(b'\n', &buf[at..end]) {
-                    Some(q) => at + q,
-                    None => end,
-                };
-                let line = &buf[at..nl];
-                if !line.is_empty() && split(line, &mut fields) {
-                    f(&fields);
-                }
-                at = nl + 1;
-                continue;
+    let mut ends = [0u32; 640];
+    let mut line_start = start;
+    let mut scan = start;
+    while line_start < end {
+        let mut cnt = 0usize;
+        while cnt < 512 && scan < end {
+            let mut m = unsafe { nl64(p.add(scan)) };
+            if end - scan < 64 {
+                m &= (1u64 << (end - scan)) - 1;
             }
-        }
-        // a line that reaches the end of data without '\n' (EOF) stops at end: padding is zero so the
-        // newline search above already stopped at the first padding byte only if it found '\n'; clamp.
-        let len = len.min(end - at);
-        let lm: u128 = (1u128 << len) - 1; // len < 128 here
-        let cm = cm & lm;
-        let qt = qt & lm;
-        if len == 0 || cm.count_ones() as usize != N - 1 {
-            at += len + 1;
-            continue;
-        }
-        let mut ok = true;
-        let mut a = 0usize;
-        let mut rest = cm;
-        for (i, slot) in fields.iter_mut().enumerate() {
-            let b = if i + 1 < N {
-                let t = rest.trailing_zeros() as usize;
-                rest &= rest - 1;
-                t
-            } else {
-                len
-            };
-            let fq = (qt >> a) & ((1u128 << (b - a)) - 1);
-            if fq == 0 {
-                *slot = unsafe { buf.get_unchecked(at + a..at + b) };
-            } else if b - a >= 2 && fq == (1 | (1u128 << (b - a - 1))) {
-                *slot = unsafe { buf.get_unchecked(at + a + 1..at + b - 1) };
-            } else {
-                ok = false;
-                break;
+            while m != 0 {
+                ends[cnt] = (scan + m.trailing_zeros() as usize) as u32;
+                cnt += 1;
+                m &= m - 1;
             }
-            a = b + 1;
+            scan += 64;
         }
-        if ok {
-            f(&fields);
+        for &e in &ends[..cnt] {
+            let e = e as usize;
+            one_line(buf, line_start, e, &mut fields, &mut f);
+            line_start = e + 1;
         }
-        at += len + 1;
+        if scan >= end && line_start < end {
+            // unterminated last line of the file
+            one_line(buf, line_start, end, &mut fields, &mut f);
+            break;
+        }
     }
 }
 
@@ -226,4 +264,33 @@ mod tests {
             assert_eq!(s, v.len() == 1, "{line:?}");
         }
     }
+}
+
+pub fn bench_masks(buf: &[u8], start: usize, end: usize) -> u64 {
+    let p = buf.as_ptr();
+    let mut at = start;
+    let mut acc = 0u64;
+    while at < end {
+        let (n0, c0, q0) = unsafe { masks64(p.add(at)) };
+        let (n1, c1, q1) = unsafe { masks64(p.add(at + 64)) };
+        let nl = n0 as u128 | ((n1 as u128) << 64);
+        let len = nl.trailing_zeros() as usize;
+        acc = acc.wrapping_add(c0 ^ q0 ^ c1 ^ q1);
+        at += len + 1;
+    }
+    acc
+}
+pub fn bench_nl(buf: &[u8], start: usize, end: usize) -> u64 {
+    let p = buf.as_ptr();
+    let mut at = start;
+    let mut acc = 0u64;
+    while at < end {
+        let (n0, _, _) = unsafe { masks64(p.add(at)) };
+        let (n1, _, _) = unsafe { masks64(p.add(at + 64)) };
+        let nl = n0 as u128 | ((n1 as u128) << 64);
+        let len = nl.trailing_zeros() as usize;
+        acc += 1;
+        at += len + 1;
+    }
+    acc
 }
