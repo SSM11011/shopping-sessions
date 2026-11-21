@@ -12,11 +12,50 @@ pub struct Arena {
     free: std::cell::UnsafeCell<Vec<*mut u8>>,
 }
 
-pub const BLOCK: usize = 16 << 10;
-
 // Each arena is only bumped by its own worker thread; the atomic just makes that Sync-safe.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
+
+pub const BLOCK: usize = 16 << 10;
+
+/// Bytes currently free as ready-made >= 2 MB buddy blocks (huge pages obtainable without compaction).
+fn free_huge_bytes() -> Option<u64> {
+    let t = std::fs::read_to_string("/proc/buddyinfo").ok()?;
+    let mut total = 0u64;
+    for l in t.lines() {
+        // "Node 0, zone   Normal  c0 c1 ... c10"
+        let counts: Vec<u64> = l.split_whitespace().skip(4).filter_map(|v| v.parse().ok()).collect();
+        for (order, c) in counts.iter().enumerate() {
+            if order >= 9 {
+                total += c << (order + 12);
+            }
+        }
+    }
+    Some(total)
+}
+
+static THP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Decide once whether arenas ask for transparent huge pages. With defrag=madvise, a huge-page fault on
+/// a fragmented machine stalls in direct compaction (costs more than it saves), so THP is used only when
+/// enough memory is already free in >= 2 MB blocks to cover `need` bytes. SESSIONS_THP=0/1 overrides.
+pub fn decide_thp(need: u64) -> bool {
+    *THP.get_or_init(|| {
+        let v = match std::env::var("SESSIONS_THP").ok().as_deref() {
+            Some("0") => false,
+            Some("1") => true,
+            _ => free_huge_bytes().is_none_or(|f| f >= need),
+        };
+        if std::env::var_os("SESSIONS_QUIET").is_none() {
+            eprintln!("thp: free-huge {:?} MB, need {} MB -> {}", free_huge_bytes().map(|f| f >> 20), need >> 20, v);
+        }
+        v
+    })
+}
+
+fn use_thp() -> bool {
+    *THP.get().unwrap_or(&true)
+}
 
 impl Arena {
     pub fn new(cap: usize) -> Self {
@@ -33,7 +72,7 @@ impl Arena {
             if p == libc::MAP_FAILED {
                 return Arena { base: std::ptr::null_mut(), cap: 0, used: AtomicUsize::new(0), free: Default::default() };
             }
-            if std::env::var_os("SESSIONS_NOTHP").is_none() {
+            if use_thp() {
                 libc::madvise(p, cap, libc::MADV_HUGEPAGE);
             }
             Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), free: Default::default() }
