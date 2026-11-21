@@ -193,9 +193,9 @@ impl LinkMap {
         LinkMap { mask, slots, bloom, bmask }
     }
 
+    /// Prefetch by precomputed hash (see `person_h`).
     #[inline(always)]
-    pub fn prefetch(&self, k: u64) {
-        let h = hash(k);
+    pub fn prefetch_h(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
             use std::arch::x86_64::*;
@@ -208,8 +208,7 @@ impl LinkMap {
     }
 
     #[inline(always)]
-    pub fn person(&self, k: u64) -> u64 {
-        let h = hash(k);
+    pub fn person_h(&self, k: u64, h: u64) -> u64 {
         let b = bloom_bits(h);
         if unsafe { *self.bloom.get_unchecked((h >> 40) as usize & self.bmask) } & b != b {
             return k;

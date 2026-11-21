@@ -431,6 +431,7 @@ fn main() {
         match task.kind {
             Kind::Event => {
                 let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
+                let mut rh = [0u64; R];
                 let mut rn = 0usize;
                 scan::lines::<7>(&buf, start, end, |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
@@ -438,25 +439,28 @@ fn main() {
                             o.ev[part_of(ev.eid)].push(arena, ev);
                             return;
                         }
-                        lmap.prefetch(ev.user);
+                        let h = hash(ev.user);
+                        lmap.prefetch_h(h);
                         let slot = rn & (R - 1);
                         if rn >= R {
                             let mut old = ring[slot];
-                            old.user = lmap.person(old.user);
+                            old.user = lmap.person_h(old.user, rh[slot]);
                             o.ev[part_of(old.eid)].push(arena, old);
                         }
                         ring[slot] = ev;
+                        rh[slot] = h;
                         rn += 1;
                     }
                 });
                 for k in rn.saturating_sub(R)..rn {
                     let mut old = ring[k & (R - 1)];
-                    old.user = lmap.person(old.user);
+                    old.user = lmap.person_h(old.user, rh[k & (R - 1)]);
                     o.ev[part_of(old.eid)].push(arena, old);
                 }
             }
             Kind::Click => {
                 let mut ring = [Ck { user: 0, click: 0, ts: 0, camp: 0 }; R];
+                let mut rh = [0u64; R];
                 let mut rn = 0usize;
                 scan::lines::<4>(&buf, start, end, |f| {
                     if f[0].is_empty() || f[1].is_empty() {
@@ -473,19 +477,21 @@ fn main() {
                         ts: (t - (ws - WEEK)) as u32,
                         camp,
                     };
-                    lmap.prefetch(c.user);
+                    let h = hash(c.user);
+                    lmap.prefetch_h(h);
                     let slot = rn & (R - 1);
                     if rn >= R {
                         let mut old = ring[slot];
-                        old.user = lmap.person(old.user);
+                        old.user = lmap.person_h(old.user, rh[slot]);
                         o.ck[part_of(old.user)].push(arena, old);
                     }
                     ring[slot] = c;
+                    rh[slot] = h;
                     rn += 1;
                 });
                 for k in rn.saturating_sub(R)..rn {
                     let mut old = ring[k & (R - 1)];
-                    old.user = lmap.person(old.user);
+                    old.user = lmap.person_h(old.user, rh[k & (R - 1)]);
                     o.ck[part_of(old.user)].push(arena, old);
                 }
             }
@@ -651,6 +657,9 @@ fn main() {
     // ---- outputs
     let mut camp_acc = vec![[0i64; 4]; ncol * ndays];
     for r in &results {
+        for (a, &x) in camp_acc.iter_mut().zip(&r.assist) {
+            a[3] += x as i64;
+        }
         for (a, b) in camp_acc.iter_mut().zip(&r.camp) {
             for k in 0..4 {
                 a[k] += b[k];
@@ -851,6 +860,8 @@ pub struct WorkerOut {
     pub revenue: Vec<i64>,
     pub top: Vec<u32>, // u32::MAX = null
     pub camp: Vec<[i64; 4]>,
+    /// assisted-session counts, [campaign * ndays + day] (dense, cache-friendly)
+    pub assist: Vec<u32>,
     count: Vec<u32>,
     pos: Vec<u32>,
     active: Vec<u32>,
@@ -873,6 +884,7 @@ impl WorkerOut {
             revenue: Vec::new(),
             top: Vec::new(),
             camp: vec![[0; 4]; cells],
+            assist: vec![0; cells],
             count: vec![0; n_camp],
             pos: vec![0; n_camp],
             active: Vec::new(),
@@ -995,7 +1007,7 @@ fn person_sessions(
         cell[2] += rev;
         for idx in 0..wo.active.len() {
             let c = wo.active[idx] as usize;
-            wo.camp[c * ndays + di][3] += 1;
+            wo.assist[c * ndays + di] += 1;
         }
         // user_daily: sessions are in start order, so a day's sessions are contiguous; flush when the next
         // session starts on another day (cats already hold only this day's purchases).

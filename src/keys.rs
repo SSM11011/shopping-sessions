@@ -137,14 +137,18 @@ unsafe fn pack16(s: &[u8]) -> Option<u64> {
     pack(s)
 }
 
+#[inline]
 pub fn bytes_into(k: u64, out: &mut Vec<u8>) {
     if k & EXOTIC == 0 {
-        for i in 0..10 {
-            let c = (k >> (54 - 6 * i)) & 63;
-            if c == 0 {
-                break;
+        // canonical: non-zero codes then zero padding; length from the trailing zero 6-bit groups
+        let len = if k == 0 { 0 } else { 10 - (k.trailing_zeros() / 6) as usize };
+        out.reserve(10);
+        unsafe {
+            let p = out.as_mut_ptr().add(out.len());
+            for i in 0..10 {
+                *p.add(i) = CHAR[((k >> (54 - 6 * i)) & 63) as usize];
             }
-            out.push(CHAR[c as usize]);
+            out.set_len(out.len() + len);
         }
     } else {
         let g = interner().lock().unwrap();
