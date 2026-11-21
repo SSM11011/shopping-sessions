@@ -417,7 +417,7 @@ fn main() {
     // ---- phase B: events and clicks. Persons are resolved here, through a small ring so each link-map
     // miss overlaps with parsing the following lines. Clicks need no dedup: they go straight to person
     // partitions; events go to event_id partitions for dedup.
-    const R: usize = 16;
+    const R: usize = 32;
     let main_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind != Kind::Link).collect();
     run_parallel(threads, main_tasks.len(), |w, t| {
         let task = main_tasks[t];
@@ -440,7 +440,10 @@ fn main() {
                             return;
                         }
                         let h = hash(ev.user);
-                        lmap.prefetch_h(h);
+                        lmap.prefetch_bloom(h);
+                        if rn >= R / 2 {
+                            lmap.prefetch_h(rh[(rn - R / 2) & (R - 1)]);
+                        }
                         let slot = rn & (R - 1);
                         if rn >= R {
                             let mut old = ring[slot];
@@ -478,7 +481,10 @@ fn main() {
                         camp,
                     };
                     let h = hash(c.user);
-                    lmap.prefetch_h(h);
+                    lmap.prefetch_bloom(h);
+                    if rn >= R / 2 {
+                        lmap.prefetch_h(rh[(rn - R / 2) & (R - 1)]);
+                    }
                     let slot = rn & (R - 1);
                     if rn >= R {
                         let mut old = ring[slot];

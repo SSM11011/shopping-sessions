@@ -195,6 +195,16 @@ impl LinkMap {
 
     /// Prefetch by precomputed hash (see `person_h`).
     #[inline(always)]
+    pub fn prefetch_bloom(&self, h: u64) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(self.bloom.as_ptr().add((h >> 40) as usize & self.bmask) as *const i8, _MM_HINT_T0);
+        }
+    }
+
+    /// Second stage: reads the (already prefetched) Bloom word and prefetches the table slot on a hit.
+    #[inline(always)]
     pub fn prefetch_h(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
         unsafe {
