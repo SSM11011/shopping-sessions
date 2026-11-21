@@ -37,6 +37,17 @@ struct Ev {
     pc: u32,
 }
 
+/// Dedup key of one event line: payload row ref (u32::MAX for an invalid copy). 16 bytes.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct Dk {
+    eid: u64,
+    ingest: u32,
+    r: u32,
+}
+
+const NO_REF: u32 = u32::MAX;
+
 /// A surviving event, keyed by person. 16 bytes.
 #[derive(Clone, Copy)]
 struct Pe {
@@ -353,7 +364,10 @@ struct Task {
 
 struct ParseOut {
     buf: Vec<u8>,
-    ev: Vec<Blocks<Ev>>,
+    /// dedup keys, by event_id partition
+    dk: Vec<Blocks<Dk>>,
+    /// payload rows, by person partition
+    pe: Vec<Blocks<Pe>>,
     ck: Vec<Blocks<Ck>>,
     links: Vec<(u64, u64)>,
     tsf: ts::Fast,
@@ -383,7 +397,7 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |n| n.get()))
-        .max(1);
+        .clamp(1, 16); // row refs hold 4 bits of worker id
 
     // ---- lookups
     let manifest = std::fs::read_to_string(data.join("manifest.json")).expect("manifest");
@@ -479,14 +493,19 @@ fn main() {
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
-    let arenas: Vec<Arena> = (0..threads).map(|_| Arena::new(arena_bytes)).collect();
+    // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
+    // a 32-bit ref = worker << 28 | (offset / 16)
+    let _ = arena_bytes;
+    let arenas: Vec<Arena> = (0..threads).map(|_| Arena::new((4usize << 30) - (2 << 20))).collect();
+
 
     let ing_base: i64 = ws.div_euclid(1000) - (1i64 << 31);
     let outs: Vec<Mutex<ParseOut>> = (0..threads)
         .map(|_| {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
-                ev: (0..nparts).map(|_| Blocks::new()).collect(),
+                dk: (0..nparts).map(|_| Blocks::new()).collect(),
+                pe: (0..nparts).map(|_| Blocks::new()).collect(),
                 ck: (0..nparts).map(|_| Blocks::new()).collect(),
                 links: Vec::new(),
                 tsf: ts::Fast::default(),
@@ -579,10 +598,20 @@ fn main() {
                 let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
                 let mut rh = [0u64; R];
                 let mut rn = 0usize;
+                let base = arena.base() as usize;
+                let wref = (w as u32) << 28;
+                // valid row: payload to its person partition, key (with a ref to the payload) to its
+                // event_id partition
+                let emit = |o: &mut ParseOut, ev: Ev, person: u64| {
+                    let p = o.pe[part_of(person)].push_ptr(arena, Pe { person, ts: ev.ts, pc: ev.pc });
+                    debug_assert!(arena.contains(p as *const u8));
+                    let r = wref | ((p as usize - base) >> 4) as u32;
+                    o.dk[part_of(ev.eid)].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r });
+                };
                 scan::lines::<7>(&buf, start, end, |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
                         if ev.ts == NO_TS {
-                            o.ev[part_of(ev.eid)].push(arena, ev);
+                            o.dk[part_of(ev.eid)].push(arena, Dk { eid: ev.eid, ingest: ev.ingest, r: NO_REF });
                             return;
                         }
                         let h = hash(ev.user);
@@ -592,9 +621,9 @@ fn main() {
                         }
                         let slot = rn & (R - 1);
                         if rn >= R {
-                            let mut old = ring[slot];
-                            old.user = lmap.person_h(old.user, rh[slot]);
-                            o.ev[part_of(old.eid)].push(arena, old);
+                            let old = ring[slot];
+                            let person = lmap.person_h(old.user, rh[slot]);
+                            emit(o, old, person);
                         }
                         ring[slot] = ev;
                         rh[slot] = h;
@@ -602,9 +631,9 @@ fn main() {
                     }
                 });
                 for k in rn.saturating_sub(R)..rn {
-                    let mut old = ring[k & (R - 1)];
-                    old.user = lmap.person_h(old.user, rh[k & (R - 1)]);
-                    o.ev[part_of(old.eid)].push(arena, old);
+                    let old = ring[k & (R - 1)];
+                    let person = lmap.person_h(old.user, rh[k & (R - 1)]);
+                    emit(o, old, person);
                 }
             }
             Kind::Click => {
@@ -657,39 +686,31 @@ fn main() {
     }
     timing(t0, "parse");
 
-    // ---- dedup per eid-partition, then re-partition survivors by person
+    // ---- dedup per event_id partition over 16-byte keys only. Earliest ingest wins (equal ingest =>
+    // identical copies, keep the first seen); every other copy's payload row is marked dead in place, and
+    // an invalid winner simply has no payload. Unique events (the vast majority) write nothing.
+    let ck_parts: Vec<Vec<Blocks<Ck>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
+    let dk_in: Vec<Vec<Blocks<Dk>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dk)).collect();
+    let pe_src: Vec<Vec<Blocks<Pe>>> = outs.into_iter().map(|o| o.pe).collect();
+    let bases: Vec<usize> = arenas.iter().map(|a| a.base() as usize).collect();
+    let kill = |r: u32| {
+        if r != NO_REF {
+            let p = (bases[(r >> 28) as usize] + (((r & ((1 << 28) - 1)) as usize) << 4)) as *mut Pe;
+            unsafe { std::ptr::addr_of_mut!((*p).ts).write(NO_TS) };
+        }
+    };
     struct Stage2 {
-        pe: Vec<Blocks<Pe>>,
-        gather: Vec<Ev>,
+        gather: Vec<Dk>,
         table: Vec<u32>,
     }
-    let st2: Vec<Mutex<Stage2>> = (0..threads)
-        .map(|_| {
-            Mutex::new(Stage2 {
-                pe: (0..nparts).map(|_| Blocks::new()).collect(),
-                gather: Vec::new(),
-                table: Vec::new(),
-            })
-        })
-        .collect();
-    let ck_parts: Vec<Vec<Blocks<Ck>>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
-    // ev_in[t][src]: each partition's lists, taken (and recycled) by whichever worker dedups it
-    let mut ev_src: Vec<Vec<Blocks<Ev>>> = outs.into_iter().map(|o| o.ev).collect();
-    let ev_in: Vec<Mutex<Vec<Blocks<Ev>>>> = (0..nparts)
-        .map(|t| Mutex::new(ev_src.iter_mut().map(|v| std::mem::take(&mut v[t])).collect()))
-        .collect();
-    drop(ev_src);
+    let st2: Vec<Mutex<Stage2>> =
+        (0..threads).map(|_| Mutex::new(Stage2 { gather: Vec::new(), table: Vec::new() })).collect();
     run_parallel(threads, nparts, |w, t| {
-        let arena = &arenas[w];
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
         st.gather.clear();
-        {
-            let mut lists = ev_in[t].lock().unwrap();
-            for l in lists.iter_mut() {
-                l.extend_into(&mut st.gather);
-                l.recycle(arena);
-            }
+        for src in &dk_in {
+            src[t].extend_into(&mut st.gather);
         }
         let n = st.gather.len();
         let cap = (n * 2).next_power_of_two().max(16);
@@ -717,24 +738,18 @@ fn main() {
                 let o = unsafe { gather.get_unchecked(s as usize) };
                 if o.eid == e.eid {
                     if e.ingest < o.ingest {
+                        kill(o.r);
                         table[i] = idx as u32;
+                    } else {
+                        kill(e.r);
                     }
                     break;
                 }
                 i = (i + 1) & mask;
             }
         }
-        for &s in table.iter() {
-            if s != u32::MAX {
-                let e = unsafe { gather.get_unchecked(s as usize) };
-                if e.ts != NO_TS {
-                    st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, pc: e.pc });
-                }
-            }
-        }
     });
-    drop(ev_in);
-    let st2: Vec<Stage2> = st2.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    drop(dk_in);
     timing(t0, "dedup");
 
     // ---- sessions per person-partition
@@ -744,7 +759,7 @@ fn main() {
     let results: Vec<Mutex<WorkerOut>> =
         (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp))).collect();
     let mut order: Vec<(usize, usize)> =
-        (0..nparts).map(|t| (st2.iter().map(|s| s.pe[t].len()).sum::<usize>(), t)).collect();
+        (0..nparts).map(|t| (pe_src.iter().map(|s| s[t].len()).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let ud_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&ud_dir).expect("mkdir");
@@ -758,12 +773,12 @@ fn main() {
         let mut cb = std::mem::take(&mut wo.cb);
         // bucket by the next hash bits below the partition bits: persons almost never share a bucket,
         // so each bucket needs only a tiny sort by (person, ts)
-        let n_ev: usize = st2.iter().map(|s| s.pe[t].len()).sum();
+        let n_ev: usize = pe_src.iter().map(|s| s[t].len()).sum();
         let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(12);
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
-        radix_events(st2.iter().map(|s| &s.pe[t]), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+        radix_events(pe_src.iter().map(|s| &s[t]), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
         bucket_scatter(ck_parts.iter().map(|v| &v[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
@@ -853,16 +868,23 @@ fn radix_events<'a>(
     out.reserve(n);
     tmp.clear();
     tmp.reserve(n);
+    let mut live = 0usize;
     for b in srcs.clone() {
         b.for_each_slice(|sl| {
             for e in sl {
-                h0[(e.ts & 2047) as usize] += 1;
-                h1[((e.ts >> 11) & 2047) as usize] += 1;
-                h2[(e.ts >> 22) as usize & 1023] += 1;
+                let ts = e.ts;
+                if ts == NO_TS {
+                    continue;
+                }
+                live += 1;
+                h0[(ts & 2047) as usize] += 1;
+                h1[((ts >> 11) & 2047) as usize] += 1;
+                h2[(ts >> 22) as usize & 1023] += 1;
                 starts[bucket(e.person) + 1] += 1;
             }
         });
     }
+    let n = live;
     fn excl(h: &mut [u32]) {
         let mut s = 0;
         for c in h.iter_mut() {
@@ -883,6 +905,9 @@ fn radix_events<'a>(
         for b in srcs {
             b.for_each_slice(|sl| {
                 for e in sl {
+                    if e.ts == NO_TS {
+                        continue;
+                    }
                     let k = (e.ts & 2047) as usize;
                     *t.add(h0[k] as usize) = *e;
                     h0[k] += 1;

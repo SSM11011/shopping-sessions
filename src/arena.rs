@@ -51,6 +51,15 @@ impl Arena {
         }
     }
 
+    pub fn base(&self) -> *mut u8 {
+        self.base
+    }
+
+    pub fn contains(&self, p: *const u8) -> bool {
+        let b = self.base as usize;
+        (p as usize) >= b && (p as usize) < b + self.cap
+    }
+
     fn block(&self) -> *mut u8 {
         match unsafe { (*self.free.get()).pop() } {
             Some(p) => p,
@@ -114,6 +123,20 @@ impl<T: Copy> Blocks<T> {
         unsafe {
             self.cur.write_unaligned(v);
             self.cur = self.cur.add(1);
+        }
+    }
+
+    /// `push` that also returns where the row landed.
+    #[inline(always)]
+    pub fn push_ptr(&mut self, arena: &Arena, v: T) -> *mut T {
+        if self.cur == self.end {
+            self.grow(arena);
+        }
+        unsafe {
+            let p = self.cur;
+            p.write_unaligned(v);
+            self.cur = p.add(1);
+            p
         }
     }
 
