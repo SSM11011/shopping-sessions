@@ -234,21 +234,28 @@ def main():
 
     def date(day):
         import datetime
-        return (datetime.date(1970, 1, 1) + datetime.timedelta(days=day)).isoformat()
+        return datetime.date(1970, 1, 1) + datetime.timedelta(days=day)
 
-    with open(out / "user_daily.csv", "wb") as f:
-        f.write(b"user_id,day,sessions,events,revenue_cents,top_category\n")
-        for (p, day), (s, n, rev, cats) in ud.items():
-            top = b""
-            if cats:
-                m = max(cats.values())
-                top = min(c for c, v in cats.items() if v == m)
-            f.write(b"%s,%s,%d,%d,%d,%s\n" % (p, date(day).encode(), s, n, rev, top))
-    with open(out / "campaign_daily.csv", "wb") as f:
-        f.write(b"campaign_id,channel,day,sessions,purchasing_sessions,revenue_cents,assisted_sessions\n")
-        for (c, day), (s, ps, rev, a) in cd.items():
-            ch = b"organic" if c == b"organic" else campaigns[c]
-            f.write(b"%s,%s,%s,%d,%d,%d,%d\n" % (c, ch, date(day).encode(), s, ps, rev, a))
+    import polars as pl
+    urows = []
+    for (p, day), (s, n, rev, cats) in ud.items():
+        top = None
+        if cats:
+            m = max(cats.values())
+            top = min(c for c, v in cats.items() if v == m).decode()
+        urows.append((p.decode(), date(day), s, n, rev, top))
+    crows = []
+    for (c, day), (s, ps, rev, a) in cd.items():
+        ch = b"organic" if c == b"organic" else campaigns[c]
+        crows.append((c.decode(), ch.decode(), date(day), s, ps, rev, a))
+    (out / "user_daily").mkdir(exist_ok=True)
+    (out / "campaign_daily").mkdir(exist_ok=True)
+    pl.DataFrame(urows, orient="row", schema={"user_id": pl.String, "day": pl.Date, "sessions": pl.Int64,
+                 "events": pl.Int64, "revenue_cents": pl.Int64, "top_category": pl.String}
+                 ).write_parquet(out / "user_daily" / "part-0.parquet")
+    pl.DataFrame(crows, orient="row", schema={"campaign_id": pl.String, "channel": pl.String, "day": pl.Date,
+                 "sessions": pl.Int64, "purchasing_sessions": pl.Int64, "revenue_cents": pl.Int64,
+                 "assisted_sessions": pl.Int64}).write_parquet(out / "campaign_daily" / "part-0.parquet")
 
 
 def read_lines_file(path: Path):
