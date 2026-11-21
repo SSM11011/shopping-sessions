@@ -367,8 +367,9 @@ fn main() {
         let arena = &arenas[w];
         let mut guard = outs[w].lock().unwrap();
         let o = &mut *guard;
-        let mut buf = std::mem::take(&mut o.buf);
-        let (start, end) = scan::load(file, *flen, task.s, task.e, &mut buf);
+        let mut own = std::mem::take(&mut o.buf);
+        let (start, end) = scan::load(file, *flen, task.s, task.e, &mut own);
+        let buf: &[u8] = &own;
         match task.kind {
             Kind::Event => {
                 let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, price: 0, cat: 0 }; R];
@@ -432,7 +433,7 @@ fn main() {
             }
             Kind::Link => unreachable!(),
         }
-        o.buf = buf;
+        o.buf = own;
     });
     let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
     for o in &mut outs {
@@ -509,7 +510,11 @@ fn main() {
     let ncol = n_camp + 1; // + organic
     let results: Vec<Mutex<WorkerOut>> =
         (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp))).collect();
+    let mut order: Vec<(usize, usize)> =
+        (0..nparts).map(|t| (st2.iter().map(|s| s.pe[t].len()).sum::<usize>(), t)).collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
     run_parallel(threads, nparts, |w, t| {
+        let t = order[t].1;
         let mut wo = results[w].lock().unwrap();
         let wo = &mut *wo;
         let mut evs = std::mem::take(&mut wo.evs);
@@ -523,15 +528,16 @@ fn main() {
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (hash(k) >> sh) as usize & bmask;
-        bucket_scatter(st2.iter().map(|s| &s.pe[t]), |e: &Pe| bucket(e.person), bmask + 1, &mut eb, &mut evs);
+        radix_events(st2.iter().map(|s| &s.pe[t]), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
         bucket_scatter(ck_parts.iter().map(|v| &v[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
             if ev.is_empty() {
                 continue;
             }
-            if ev.len() > 1 {
-                ev.sort_unstable_by_key(|e| (e.person, e.ts));
+            // already in ts order within the bucket; group persons if several share it (stable)
+            if ev.len() > 1 && ev.iter().any(|e| e.person != ev[0].person) {
+                ev.sort_by_key(|e| e.person);
             }
             let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
             if ck.len() > 1 {
@@ -582,6 +588,85 @@ fn main() {
 }
 
 /// Counting-sort the elements of several block lists into `out` by bucket; `starts` gets bucket offsets.
+/// Partition events -> `out` ordered by (bucket, ts): LSD radix on ts (11+11+10 bits) then a stable
+/// pass on the bucket. One read of the blocks builds all four histograms.
+fn radix_events<'a>(
+    srcs: impl Iterator<Item = &'a Blocks<Pe>> + Clone,
+    n: usize,
+    bucket: &impl Fn(u64) -> usize,
+    nb: usize,
+    starts: &mut Vec<u32>,
+    out: &mut Vec<Pe>,
+    tmp: &mut Vec<Pe>,
+) {
+    let mut h0 = [0u32; 2048];
+    let mut h1 = [0u32; 2048];
+    let mut h2 = [0u32; 1024];
+    starts.clear();
+    starts.resize(nb + 1, 0);
+    out.clear();
+    out.reserve(n);
+    tmp.clear();
+    tmp.reserve(n);
+    for b in srcs.clone() {
+        b.for_each_slice(|sl| {
+            for e in sl {
+                h0[(e.ts & 2047) as usize] += 1;
+                h1[((e.ts >> 11) & 2047) as usize] += 1;
+                h2[(e.ts >> 22) as usize & 1023] += 1;
+                starts[bucket(e.person) + 1] += 1;
+            }
+        });
+    }
+    fn excl(h: &mut [u32]) {
+        let mut s = 0;
+        for c in h.iter_mut() {
+            let x = *c;
+            *c = s;
+            s += x;
+        }
+    }
+    excl(&mut h0);
+    excl(&mut h1);
+    excl(&mut h2);
+    for i in 0..nb {
+        starts[i + 1] += starts[i];
+    }
+    unsafe {
+        let o = out.as_mut_ptr();
+        let t = tmp.as_mut_ptr();
+        for b in srcs {
+            b.for_each_slice(|sl| {
+                for e in sl {
+                    let k = (e.ts & 2047) as usize;
+                    *t.add(h0[k] as usize) = *e;
+                    h0[k] += 1;
+                }
+            });
+        }
+        for i in 0..n {
+            let e = *t.add(i);
+            let k = ((e.ts >> 11) & 2047) as usize;
+            *o.add(h1[k] as usize) = e;
+            h1[k] += 1;
+        }
+        for i in 0..n {
+            let e = *o.add(i);
+            let k = (e.ts >> 22) as usize & 1023;
+            *t.add(h2[k] as usize) = e;
+            h2[k] += 1;
+        }
+        let mut pos: Vec<u32> = starts[..nb].to_vec();
+        for i in 0..n {
+            let e = *t.add(i);
+            let k = bucket(e.person);
+            *o.add(pos[k] as usize) = e;
+            pos[k] += 1;
+        }
+        out.set_len(n);
+    }
+}
+
 fn bucket_scatter<'a, T: Copy + 'a>(
     srcs: impl Iterator<Item = &'a Blocks<T>> + Clone,
     key: impl Fn(&T) -> usize,
@@ -700,6 +785,7 @@ pub struct WorkerOut {
     cks: Vec<Ck>,
     eb: Vec<u32>,
     cb: Vec<u32>,
+    scratch: Vec<Pe>,
 }
 
 impl WorkerOut {
@@ -721,6 +807,7 @@ impl WorkerOut {
             cks: Vec::new(),
             eb: Vec::new(),
             cb: Vec::new(),
+            scratch: Vec::new(),
         }
     }
     #[inline]
