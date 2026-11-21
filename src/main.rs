@@ -187,6 +187,34 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     v
 }
 
+/// CPUs this process may run on (the container's cpuset), for pinning worker w to cpus[w % n].
+fn allowed_cpus() -> &'static [usize] {
+    static C: std::sync::OnceLock<Vec<usize>> = std::sync::OnceLock::new();
+    C.get_or_init(|| unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize).filter(|&c| libc::CPU_ISSET(c, &set)).collect()
+    })
+}
+
+#[inline]
+fn pin(w: usize) {
+    if std::env::var_os("SESSIONS_PIN").is_none() {
+        return;
+    }
+    let cpus = allowed_cpus();
+    if cpus.is_empty() {
+        return;
+    }
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        libc::CPU_SET(cpus[w % cpus.len()], &mut set);
+        libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set);
+    }
+}
+
 /// Like run_parallel, then each worker runs `fin(w)` as soon as no tasks are left for it.
 fn run_parallel_fin(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync, fin: impl Fn(usize) + Sync) {
     let next = AtomicUsize::new(0);
@@ -194,6 +222,7 @@ fn run_parallel_fin(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + S
         for w in 0..threads {
             let (f, fin, next) = (&f, &fin, &next);
             s.spawn(move || {
+                pin(w);
                 loop {
                     let t = next.fetch_add(1, Ordering::Relaxed);
                     if t >= n_tasks {
@@ -214,6 +243,7 @@ fn run_parallel(threads: usize, n_tasks: usize, f: impl Fn(usize, usize) + Sync)
             let f = &f;
             let next = &next;
             s.spawn(move || {
+                pin(w);
                 loop {
                     let t = next.fetch_add(1, Ordering::Relaxed);
                     if t >= n_tasks {
@@ -552,7 +582,15 @@ fn main() {
         st.table.resize(cap, u32::MAX);
         let gather = &st.gather;
         let table = &mut st.table;
+        const DPF: usize = 8;
         for (idx, e) in gather.iter().enumerate() {
+            if idx + DPF < n {
+                let j = (hash(unsafe { gather.get_unchecked(idx + DPF) }.eid) as usize >> 3) & mask;
+                #[cfg(target_arch = "x86_64")]
+                unsafe {
+                    std::arch::x86_64::_mm_prefetch(table.as_ptr().add(j) as *const i8, std::arch::x86_64::_MM_HINT_T0);
+                }
+            }
             let mut i = (hash(e.eid) as usize >> 3) & mask;
             loop {
                 let s = unsafe { *table.get_unchecked(i) };
