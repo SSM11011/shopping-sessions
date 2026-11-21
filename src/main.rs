@@ -84,12 +84,36 @@ fn small_lines<const N: usize>(data: &[u8], mut f: impl FnMut([&[u8]; N])) {
 struct NumMap {
     prefix: &'static [u8],
     table: Vec<u32>,
+    /// u8 copy of `table` (255 = absent) when every value fits: 4x smaller, stays in L1/L2
+    narrow: Vec<u8>,
     other: HashMap<Vec<u8>, u32>,
 }
 
 impl NumMap {
+    /// Switch lookups to the u8 table if all values are < 255 (call after the last insert).
+    fn narrow(&mut self) {
+        if self.table.iter().all(|&v| v == u32::MAX || v < 255) {
+            self.narrow = self.table.iter().map(|&v| if v == u32::MAX { 255 } else { v as u8 }).collect();
+        }
+    }
+    #[inline(always)]
+    fn lookup(&self, n: usize) -> Option<Option<u32>> {
+        if !self.narrow.is_empty() {
+            if n < self.narrow.len() {
+                let v = self.narrow[n];
+                return Some(if v == 255 { None } else { Some(v as u32) });
+            }
+            return None;
+        }
+        if n < self.table.len() {
+            let v = self.table[n];
+            return Some(if v == u32::MAX { None } else { Some(v) });
+        }
+        None
+    }
+
     fn new(prefix: &'static [u8]) -> Self {
-        NumMap { prefix, table: Vec::new(), other: HashMap::new() }
+        NumMap { prefix, table: Vec::new(), narrow: Vec::new(), other: HashMap::new() }
     }
     #[inline(always)]
     fn num(&self, s: &[u8]) -> Option<usize> {
@@ -134,9 +158,8 @@ impl NumMap {
                 && (y.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
             {
                 let n = ts::parse8(y) as usize;
-                if n < self.table.len() {
-                    let v = self.table[n];
-                    return if v == u32::MAX { None } else { Some(v) };
+                if let Some(r) = self.lookup(n) {
+                    return r;
                 }
             }
         }
@@ -367,18 +390,41 @@ fn main() {
     assert!(we > ws && we - ws + WEEK < u32::MAX as i64, "window too long");
 
     let prod_bytes = read_small(&data.join("products.csv"));
-    let mut prod_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    small_lines::<2>(&prod_bytes, |[p, c]| prod_rows.push((p.to_vec(), c.to_vec())));
-    let mut cat_names: Vec<Vec<u8>> = prod_rows.iter().map(|r| r.1.clone()).collect();
+    // one pass: product -> provisional category id (first-seen order), no per-row allocations
+    let mut prov: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut prov_names: Vec<Vec<u8>> = Vec::new();
+    let mut prod_rows: Vec<(std::ops::Range<usize>, u32)> = Vec::new();
+    let base = prod_bytes.as_ptr() as usize;
+    let mut pbuf = prod_bytes.clone();
+    pbuf.extend_from_slice(&[0u8; scan::PAD]);
+    let pstart = memchr::memchr(b'\n', &prod_bytes).map_or(prod_bytes.len(), |p| p + 1);
+    let pb = pbuf.as_ptr() as usize;
+    let _ = base;
+    scan::lines::<2>(&pbuf, pstart, prod_bytes.len(), |[p, c]| {
+        let id = match prov.get(*c) {
+            Some(&i) => i,
+            None => {
+                let i = prov_names.len() as u32;
+                prov.insert(c.to_vec(), i);
+                prov_names.push(c.to_vec());
+                i
+            }
+        };
+        let off = p.as_ptr() as usize - pb;
+        prod_rows.push((off..off + p.len(), id));
+    });
+    let mut cat_names: Vec<Vec<u8>> = prov_names.clone();
     cat_names.push(b"unknown".to_vec());
     cat_names.sort();
     cat_names.dedup();
     let cat_id: HashMap<Vec<u8>, u32> =
         cat_names.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
+    let remap: Vec<u32> = prov_names.iter().map(|c| cat_id[c]).collect();
     let mut products = NumMap::new(b"p");
-    for (p, c) in &prod_rows {
-        products.insert(p, cat_id[c]);
+    for (r, id) in &prod_rows {
+        products.insert(&pbuf[r.clone()], remap[*id as usize]);
     }
+    products.narrow();
     let unknown_cat = cat_id[&b"unknown"[..]];
     assert!(cat_names.len() <= 256, "more than 255 categories");
 
@@ -1269,6 +1315,24 @@ mod tests {
             }
             let s = &buf[..n];
             assert_eq!(unsafe { m.get_padded(s) }, m.get(s), "{:?}", s);
+        }
+        // same checks with the narrow (u8) table active
+        let mut m2 = NumMap::new(b"p");
+        for i in [1usize, 2, 7, 10, 99, 100, 5000, 49999, 50000] {
+            m2.insert(format!("p{i}").as_bytes(), (i % 200) as u32);
+        }
+        m2.insert(b"P5", 1);
+        m2.narrow();
+        assert!(!m2.narrow.is_empty());
+        for _ in 0..100_000 {
+            let n = (rnd() % 8) as usize;
+            let mut buf = vec![0u8; 32];
+            buf[0] = b'p';
+            for b in buf.iter_mut().take(n).skip(1) {
+                *b = b'0' + (rnd() % 10) as u8;
+            }
+            let s = &buf[..n];
+            assert_eq!(unsafe { m2.get_padded(s) }, m2.get(s), "{:?}", s);
         }
         for k in [&b"p1"[..], b"p50000", b"p12345678", b"p99999999", b"p050", b"P5", b"x", b"p0", b"p"] {
             let mut buf = k.to_vec();
