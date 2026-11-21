@@ -661,7 +661,8 @@ fn main() {
     struct Stage2 {
         pe: Vec<Blocks<Pe>>,
         gather: Vec<Ev>,
-        table: Vec<u32>,
+        table: Vec<u64>,
+        win: Vec<u8>,
     }
     let st2: Vec<Mutex<Stage2>> = (0..threads)
         .map(|_| {
@@ -669,6 +670,7 @@ fn main() {
                 pe: (0..nparts).map(|_| Blocks::new()).collect(),
                 gather: Vec::new(),
                 table: Vec::new(),
+                win: Vec::new(),
             })
         })
         .collect();
@@ -694,10 +696,15 @@ fn main() {
         let n = st.gather.len();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
+        // slot = fingerprint << 32 | row index: a different event in the slot is rejected without touching
+        // its row; rows are only read on a fingerprint match (almost always a real duplicate)
         st.table.clear();
-        st.table.resize(cap, u32::MAX);
+        st.table.resize(cap, u64::MAX);
+        st.win.clear();
+        st.win.resize(n, 0);
         let gather = &st.gather;
         let table = &mut st.table;
+        let win = &mut st.win;
         const DPF: usize = 8;
         for (idx, e) in gather.iter().enumerate() {
             if idx + DPF < n {
@@ -707,29 +714,34 @@ fn main() {
                     std::arch::x86_64::_mm_prefetch(table.as_ptr().add(j) as *const i8, std::arch::x86_64::_MM_HINT_T0);
                 }
             }
-            let mut i = (hash(e.eid) as usize >> 3) & mask;
+            let h = hash(e.eid);
+            let fp = (h >> 32) << 32;
+            let mut i = (h as usize >> 3) & mask;
             loop {
                 let s = unsafe { *table.get_unchecked(i) };
-                if s == u32::MAX {
-                    table[i] = idx as u32;
+                if s == u64::MAX {
+                    table[i] = fp | idx as u64;
+                    win[idx] = 1;
                     break;
                 }
-                let o = unsafe { gather.get_unchecked(s as usize) };
-                if o.eid == e.eid {
-                    if e.ingest < o.ingest {
-                        table[i] = idx as u32;
+                if s & !0xFFFF_FFFF == fp {
+                    let oi = (s & 0xFFFF_FFFF) as usize;
+                    let o = unsafe { gather.get_unchecked(oi) };
+                    if o.eid == e.eid {
+                        if e.ingest < o.ingest {
+                            table[i] = fp | idx as u64;
+                            win[oi] = 0;
+                            win[idx] = 1;
+                        }
+                        break;
                     }
-                    break;
                 }
                 i = (i + 1) & mask;
             }
         }
-        for &s in table.iter() {
-            if s != u32::MAX {
-                let e = unsafe { gather.get_unchecked(s as usize) };
-                if e.ts != NO_TS {
-                    st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, pc: e.pc });
-                }
+        for (idx, e) in gather.iter().enumerate() {
+            if win[idx] != 0 && e.ts != NO_TS {
+                st.pe[part_of(e.user)].push(arena, Pe { person: e.user, ts: e.ts, pc: e.pc });
             }
         }
     });
