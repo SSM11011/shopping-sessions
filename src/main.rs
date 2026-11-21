@@ -191,6 +191,7 @@ struct ParseOut {
     ev: Vec<Blocks<Ev>>,
     ck: Blocks<Ck>,
     links: Vec<(u64, u64)>,
+    tsf: ts::Fast,
 }
 
 const BLOCK: usize = 16 << 10;
@@ -298,12 +299,13 @@ fn main() {
                 ev: (0..nparts).map(|_| Blocks::new(BLOCK)).collect(),
                 ck: Blocks::new(1 << 20),
                 links: Vec::new(),
+                tsf: ts::Fast::default(),
             })
         })
         .collect();
     timing(t0, "setup");
     if std::env::var_os("EXP_MICRO").is_some() {
-        micro(&files, &ctx);
+        micro(&files, &ctx, ws);
         return;
     }
 
@@ -317,39 +319,31 @@ fn main() {
         let (start, end) = scan::load(file, *flen, task.s, task.e, &mut buf);
         match task.kind {
             Kind::Event => scan::lines::<7>(&buf, start, end, |f| {
-                if f[0].is_empty() {
-                    return;
+                if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
+                    o.ev[part_of(ev.eid)].push(arena, ev);
                 }
-                let eid = key(f[0]);
-                let (ingest, ing32) = match ts::parse(f[3]) {
-                    Some(v) => (v, (v.div_euclid(1000) - ing_base).clamp(0, u32::MAX as i64 - 1) as u32),
-                    None => (i64::MAX, u32::MAX),
-                };
-                let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, price: 0, cat: 0 };
-                if let Some(v) = validate(&ctx, f, ingest) {
-                    ev.user = key(f[1]);
-                    ev.ts = v.0;
-                    ev.price = v.1;
-                    ev.cat = v.2;
-                }
-                o.ev[part_of(eid)].push(arena, ev);
             }),
             Kind::Click => scan::lines::<4>(&buf, start, end, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
                 let Some(camp) = ctx.campaigns.get(f[2]) else { return };
-                let Some(t) = ts::parse(f[3]) else { return };
+                let Some(t) = o.tsf.parse(f[3]) else { return };
                 if t < ws - WEEK || t >= we {
                     return;
                 }
-                o.ck.push(arena, Ck { user: key(f[1]), click: key(f[0]), ts: (t - (ws - WEEK)) as u32, camp });
+                o.ck.push(arena, Ck {
+                    user: unsafe { keys::key_padded(f[1]) },
+                    click: unsafe { keys::key_padded(f[0]) },
+                    ts: (t - (ws - WEEK)) as u32,
+                    camp,
+                });
             }),
             Kind::Link => scan::lines::<2>(&buf, start, end, |f| {
                 if f[0].is_empty() || f[1].is_empty() {
                     return;
                 }
-                o.links.push((key(f[0]), key(f[1])));
+                o.links.push(unsafe { (keys::key_padded(f[0]), keys::key_padded(f[1])) });
             }),
         }
         o.buf = buf;
@@ -502,35 +496,53 @@ fn main() {
         let wo = &mut *wo;
         let mut evs = std::mem::take(&mut wo.evs);
         let mut cks = std::mem::take(&mut wo.cks);
-        evs.clear();
-        cks.clear();
-        for s in &st2 {
-            s.pe[t].extend_into(&mut evs);
-            s.ck[t].extend_into(&mut cks);
+        let mut eb = std::mem::take(&mut wo.eb);
+        let mut cb = std::mem::take(&mut wo.cb);
+        // bucket by the next hash bits below the partition bits: persons almost never share a bucket,
+        // so each bucket needs only a tiny sort by (person, ts)
+        let n_ev: usize = st2.iter().map(|s| s.pe[t].len()).sum();
+        let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(12);
+        let sh = pshift - bits;
+        let bmask = (1usize << bits) - 1;
+        let bucket = |k: u64| (hash(k) >> sh) as usize & bmask;
+        bucket_scatter(st2.iter().map(|s| &s.pe[t]), |e: &Pe| bucket(e.person), bmask + 1, &mut eb, &mut evs);
+        bucket_scatter(st2.iter().map(|s| &s.ck[t]), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
+        for b in 0..=bmask {
+            let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
+            if ev.is_empty() {
+                continue;
+            }
+            if ev.len() > 1 {
+                ev.sort_unstable_by_key(|e| (e.person, e.ts));
+            }
+            let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
+            if ck.len() > 1 {
+                ck.sort_unstable_by(|a, b| {
+                    a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| cmp_key(a.click, b.click))
+                });
+            }
+            let mut ci = 0;
+            let mut i = 0;
+            while i < ev.len() {
+                let person = ev[i].person;
+                let mut j = i + 1;
+                while j < ev.len() && ev[j].person == person {
+                    j += 1;
+                }
+                while ci < ck.len() && ck[ci].user < person {
+                    ci += 1;
+                }
+                let mut cj = ci;
+                while cj < ck.len() && ck[cj].user == person {
+                    cj += 1;
+                }
+                person_sessions(wo, &ev[i..j], &ck[ci..cj], person, ws, ws_day, ndays, n_camp);
+                ci = cj;
+                i = j;
+            }
         }
-        evs.sort_unstable_by_key(|e| (e.person, e.ts));
-        cks.sort_unstable_by(|a, b| {
-            a.user.cmp(&b.user).then(a.ts.cmp(&b.ts)).then_with(|| cmp_key(a.click, b.click))
-        });
-        let mut ci = 0;
-        let mut i = 0;
-        while i < evs.len() {
-            let person = evs[i].person;
-            let mut j = i + 1;
-            while j < evs.len() && evs[j].person == person {
-                j += 1;
-            }
-            while ci < cks.len() && cks[ci].user < person {
-                ci += 1;
-            }
-            let mut cj = ci;
-            while cj < cks.len() && cks[cj].user == person {
-                cj += 1;
-            }
-            person_sessions(wo, &evs[i..j], &cks[ci..cj], person, ws, ws_day, ndays, n_camp);
-            ci = cj;
-            i = j;
-        }
+        wo.eb = eb;
+        wo.cb = cb;
         wo.evs = evs;
         wo.cks = cks;
     });
@@ -551,17 +563,76 @@ fn main() {
     std::process::exit(0);
 }
 
+/// Counting-sort the elements of several block lists into `out` by bucket; `starts` gets bucket offsets.
+fn bucket_scatter<'a, T: Copy + 'a>(
+    srcs: impl Iterator<Item = &'a Blocks<T>> + Clone,
+    key: impl Fn(&T) -> usize,
+    nb: usize,
+    starts: &mut Vec<u32>,
+    out: &mut Vec<T>,
+) {
+    starts.clear();
+    starts.resize(nb + 1, 0);
+    let mut n = 0usize;
+    for b in srcs.clone() {
+        b.for_each_slice(|sl| {
+            n += sl.len();
+            for e in sl {
+                starts[key(e) + 1] += 1;
+            }
+        });
+    }
+    for i in 0..nb {
+        starts[i + 1] += starts[i];
+    }
+    out.clear();
+    out.reserve(n);
+    let dst = out.as_mut_ptr();
+    let mut pos: Vec<u32> = starts[..nb].to_vec();
+    for b in srcs {
+        b.for_each_slice(|sl| {
+            for e in sl {
+                let k = key(e);
+                unsafe { *dst.add(pos[k] as usize) = *e };
+                pos[k] += 1;
+            }
+        });
+    }
+    unsafe { out.set_len(n) };
+}
+
 struct SendPtr<T>(*mut T);
 unsafe impl<T> Sync for SendPtr<T> {}
 unsafe impl<T> Send for SendPtr<T> {}
 
+/// An event line -> dedup candidate (None if the event_id is empty).
+#[inline(always)]
+fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> Option<Ev> {
+    if f[0].is_empty() {
+        return None;
+    }
+    let eid = unsafe { keys::key_padded(f[0]) };
+    let (ingest, ing32) = match tsf.parse(f[3]) {
+        Some(v) => (v, (v.div_euclid(1000) - ing_base).clamp(0, u32::MAX as i64 - 1) as u32),
+        None => (i64::MAX, u32::MAX),
+    };
+    let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, price: 0, cat: 0 };
+    if let Some(v) = validate(ctx, tsf, f, ingest) {
+        ev.user = unsafe { keys::key_padded(f[1]) };
+        ev.ts = v.0;
+        ev.price = v.1;
+        ev.cat = v.2;
+    }
+    Some(ev)
+}
+
 /// Returns (ts_rel, price, cat) when the row is a valid, non-late event.
 #[inline(always)]
-fn validate(ctx: &Ctx, f: &[&[u8]; 7], ingest: i64) -> Option<(u32, u32, u32)> {
+fn validate(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ingest: i64) -> Option<(u32, u32, u32)> {
     if f[1].is_empty() || f[5].is_empty() {
         return None;
     }
-    let t = ts::parse(f[2])?;
+    let t = tsf.parse(f[2])?;
     if t < ctx.ws || t >= ctx.we {
         return None;
     }
@@ -612,6 +683,8 @@ pub struct WorkerOut {
     cats: Vec<(u32, u64)>,
     evs: Vec<Pe>,
     cks: Vec<Ck>,
+    eb: Vec<u32>,
+    cb: Vec<u32>,
 }
 
 impl WorkerOut {
@@ -631,6 +704,8 @@ impl WorkerOut {
             cats: Vec::new(),
             evs: Vec::new(),
             cks: Vec::new(),
+            eb: Vec::new(),
+            cb: Vec::new(),
         }
     }
     #[inline]
@@ -764,7 +839,7 @@ fn person_sessions(
     }
 }
 
-fn micro(files: &[(File, usize)], ctx: &Ctx) {
+fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     let (f, len) = &files.iter().max_by_key(|x| x.1).unwrap();
     let mut buf = Vec::new();
     let (start, end) = scan::load(f, *len, 0, *len, &mut buf);
@@ -785,7 +860,18 @@ fn micro(files: &[(File, usize)], ctx: &Ctx) {
     run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += f[0].len() as u64); c });
     run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
     run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
+    run("ingestF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(tf.parse(f[3]).unwrap_or(0) as u64)); c });
+    run("tsF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(tf.parse(f[2]).unwrap_or(0) as u64)); c });
     run("ts", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64)); c });
     run("product", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += ctx.products.get(f[5]).unwrap_or(0) as u64); c });
-    run("validate", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, f, 0).map_or(0, |v| v.0 as u64)); c });
+    let ib = _ws.div_euclid(1000) - (1i64 << 31);
+    run("event", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(parse_event(ctx, &mut tf, f, ib).map_or(0, |v| v.eid ^ v.user))); c });
+    run("event+push", &|| {
+        let arena = Arena::new(1 << 30);
+        let mut parts: Vec<Blocks<Ev>> = (0..2048).map(|_| Blocks::new(BLOCK)).collect();
+        let mut tf = ts::Fast::default();
+        scan::lines::<7>(&buf, start, end, |f| if let Some(ev) = parse_event(ctx, &mut tf, f, ib) { parts[(hash(ev.eid) >> 53) as usize].push(&arena, ev) });
+        parts.iter().map(|p| p.len() as u64).sum()
+    });
+    run("validate", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, &mut tf, f, 0).map_or(0, |v| v.0 as u64)); c });
 }

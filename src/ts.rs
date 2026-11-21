@@ -93,6 +93,142 @@ pub fn parse(s: &[u8]) -> Option<i64> {
     }
 }
 
+/// Per-thread cache of validated calendar dates (`YYYY-MM-DD` bytes -> days since epoch). A window spans
+/// only a few dozen distinct dates, so after warm-up the date part costs one compare.
+pub struct Fast {
+    k8: [u64; 64],
+    k2: [u16; 64],
+    days: [i64; 64],
+}
+
+impl Default for Fast {
+    fn default() -> Self {
+        Fast { k8: [u64::MAX; 64], k2: [0; 64], days: [0; 64] }
+    }
+}
+
+#[inline(always)]
+fn le64(s: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(s[at..at + 8].try_into().unwrap())
+}
+
+/// "hh:mm:ss" at s[11..19] -> seconds of day, validated.
+#[inline(always)]
+fn time_of_day(s: &[u8]) -> Option<i64> {
+    const T: u64 = 0x3030_3a30_303a_3030;
+    const DIG: u64 = 0xF0F0_00F0_F000_F0F0;
+    const COL: u64 = 0x0000_FF00_00FF_0000;
+    let t = le64(s, 11);
+    if (t ^ T) & COL != 0 || (t & DIG) != (T & DIG) || (t.wrapping_add(0x0606_0006_0600_0606) & DIG) != (T & DIG) {
+        return None;
+    }
+    let d = t.wrapping_sub(T);
+    let b = |i: u32| ((d >> (8 * i)) & 0xFF) as i64;
+    let (h, m, sec) = (b(0) * 10 + b(1), b(3) * 10 + b(4), b(6) * 10 + b(7));
+    if h > 23 || m > 59 || sec > 59 {
+        return None;
+    }
+    Some(h * 3600 + m * 60 + sec)
+}
+
+/// Exactly 13 ASCII digits (epoch ms for years 2001..2286) -> value.
+#[inline(always)]
+fn digits13(s: &[u8]) -> Option<i64> {
+    let a = le64(s, 0);
+    let b = le64(s, 5); // bytes 5..13 (overlaps 5..8)
+    let ok = |x: u64| (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
+        && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030;
+    if !ok(a) || !ok(b) {
+        return None;
+    }
+    #[inline(always)]
+    fn parse8(x: u64) -> u64 {
+        let x = x.wrapping_sub(0x3030_3030_3030_3030);
+        let x = x.wrapping_mul(10).wrapping_add(x >> 8);
+        (((x & 0x0000_00FF_0000_00FF).wrapping_mul(100 + (1_000_000 << 32)))
+            .wrapping_add(((x >> 16) & 0x0000_00FF_0000_00FF).wrapping_mul(1 + (10_000 << 32))))
+            >> 32
+    }
+    // value = first 8 digits * 10^5 + last 5 digits; last 5 = parse8(b) mod 10^5 (b holds digits 5..13)
+    let hi = parse8(a);
+    let lo = parse8(b) % 100_000;
+    Some((hi * 100_000 + lo) as i64)
+}
+
+impl Fast {
+    #[inline(always)]
+    fn date(&mut self, s: &[u8]) -> Option<i64> {
+        let k8 = le64(s, 0);
+        let k2 = u16::from_le_bytes([s[8], s[9]]);
+        let h = ((k8 ^ (k2 as u64).wrapping_mul(0x9E37_79B9)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+        if self.k8[h] == k8 && self.k2[h] == k2 {
+            return Some(self.days[h]);
+        }
+        let d = date_slow(s)?;
+        self.k8[h] = k8;
+        self.k2[h] = k2;
+        self.days[h] = d;
+        Some(d)
+    }
+
+    /// Same result as `parse`, faster on the common shapes.
+    #[inline(always)]
+    pub fn parse(&mut self, s: &[u8]) -> Option<i64> {
+        match s.len() {
+            20 => {
+                if s[10] != b'T' || s[19] != b'Z' {
+                    return None;
+                }
+                let days = self.date(s)?;
+                let tod = time_of_day(s)?;
+                Some((days * 86_400 + tod) * SECOND)
+            }
+            13 => match digits13(s) {
+                Some(v) => Some(v),
+                None => parse(s),
+            },
+            25 => {
+                if s[10] != b'T' {
+                    return None;
+                }
+                let days = self.date(s)?;
+                let tod = time_of_day(s)?;
+                let base = (days * 86_400 + tod) * SECOND;
+                let sign = s[19];
+                if (sign != b'+' && sign != b'-') || s[22] != b':' {
+                    return None;
+                }
+                let oh = d2(s, 20)?;
+                let om = d2(s, 23)?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                let off = (oh * 60 + om) * 60_000;
+                Some(if sign == b'+' { base - off } else { base + off })
+            }
+            _ => parse(s),
+        }
+    }
+}
+
+/// Validated `YYYY-MM-DD` at s[0..10] -> days since epoch.
+fn date_slow(s: &[u8]) -> Option<i64> {
+    if s[4] != b'-' || s[7] != b'-' {
+        return None;
+    }
+    let y = d2(s, 0)? * 100 + d2(s, 2)?;
+    let mo = d2(s, 5)?;
+    let day = d2(s, 8)?;
+    if !(1..=12).contains(&mo) || day < 1 {
+        return None;
+    }
+    let md = if mo == 2 && is_leap(y) { 29 } else { MDAYS[mo as usize] };
+    if day > md {
+        return None;
+    }
+    Some(days_from_civil(y, mo, day))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,5 +251,33 @@ mod tests {
         assert!(parse(b"2028-02-29T00:00:00Z").is_some());
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
         assert_eq!(parse(b"86400000"), Some(86_400_000));
+    }
+
+    #[test]
+    fn fast_matches_slow() {
+        let mut fast = Fast::default();
+        let mut x: u64 = 99;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let base: Vec<&[u8]> = vec![
+            b"2026-10-03T23:58:10Z", b"2028-02-29T00:00:00Z", b"2027-02-28T23:59:59Z", b"2026-10-03T19:58:10-04:00",
+            b"1791071890000", b"0001791071890000", b"2026-12-31T00:00:00+12:00",
+        ];
+        let alphabet = b"0123456789:-TZtz+ .\x00\xff";
+        for _ in 0..300_000 {
+            let mut v = base[(rnd() % base.len() as u64) as usize].to_vec();
+            for _ in 0..(rnd() % 3) {
+                let i = (rnd() % v.len() as u64) as usize;
+                v[i] = alphabet[(rnd() % alphabet.len() as u64) as usize];
+            }
+            assert_eq!(fast.parse(&v), parse(&v), "{:?}", String::from_utf8_lossy(&v));
+        }
+        for s in base {
+            assert_eq!(fast.parse(s), parse(s));
+        }
     }
 }

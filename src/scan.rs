@@ -239,6 +239,34 @@ mod tests {
         out
     }
     #[test]
+    fn random_lines_match_scalar() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alphabet = [b'a', b',', b'"', b' ', b'\r', b'b'];
+        for _ in 0..200_000 {
+            let len = (rnd() % 140) as usize;
+            let line: Vec<u8> = (0..len).map(|_| alphabet[(rnd() % 6) as usize]).collect();
+            let mut data = line.clone();
+            data.push(b'\n');
+            let got3 = run::<3>(&data);
+            let mut f = [&b""[..]; 3];
+            let ok = split(&line, &mut f);
+            if ok {
+                assert_eq!(got3.len(), 1, "{:?}", String::from_utf8_lossy(&line));
+                let want: Vec<Vec<u8>> = f.iter().map(|v| v.to_vec()).collect();
+                assert_eq!(got3[0], want, "{:?}", String::from_utf8_lossy(&line));
+            } else {
+                assert!(got3.is_empty(), "{:?}", String::from_utf8_lossy(&line));
+            }
+        }
+    }
+
+    #[test]
     fn splitting() {
         let long = format!("{},b\n", "x".repeat(300));
         let mid = format!("{},\"{}\"\n", "y".repeat(70), "z".repeat(40));
