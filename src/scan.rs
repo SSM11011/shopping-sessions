@@ -166,6 +166,12 @@ unsafe fn nl64(p: *const u8) -> u64 {
 #[inline(always)]
 fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: &mut [&'a [u8]; N]) -> bool {
     let p = buf.as_ptr();
+    if N < 7 && len < 64 {
+        // one block, all-u64 masks (most click and link lines)
+        let (_, c0, q0) = unsafe { masks64(p.add(s)) };
+        let lm = (1u64 << len) - 1;
+        return validate_extract64(buf, s, len, c0 & lm, q0 & lm, fields);
+    }
     let lm: u128 = (1u128 << len) - 1;
     if len <= 96 {
         let (c, q) = unsafe { masks96(p.add(s)) };
@@ -176,6 +182,36 @@ fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: 
     let c = (c0 as u128 | ((c1 as u128) << 64)) & lm;
     let q = (q0 as u128 | ((q1 as u128) << 64)) & lm;
     validate_extract(buf, s, len, c, q, fields)
+}
+
+/// `validate_extract` for a line shorter than 64 bytes.
+#[inline(always)]
+fn validate_extract64<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, c: u64, q: u64, fields: &mut [&'a [u8]; N]) -> bool {
+    if c.count_ones() as usize != N - 1 || len == 0 {
+        return false;
+    }
+    let starts = (c << 1) | 1;
+    let lasts = (c | (1u64 << len)) >> 1;
+    let a_mask = q & starts;
+    let b = q & lasts;
+    if (q ^ (a_mask | b)) | (a_mask & b) | (b.wrapping_sub(a_mask) & (c | lasts)) != 0 {
+        return false;
+    }
+    let mut fs = 0usize;
+    let mut m = c;
+    for (i, slot) in fields.iter_mut().enumerate() {
+        let fe = if i + 1 < N {
+            let t = m.trailing_zeros() as usize;
+            m &= m.wrapping_sub(1);
+            t
+        } else {
+            len
+        };
+        let qd = (unsafe { *buf.get_unchecked(s + fs) } == b'"') as usize;
+        *slot = unsafe { buf.get_unchecked(s + fs + qd..s + fe - qd) };
+        fs = fe + 1;
+    }
+    true
 }
 
 /// Given the comma and quote masks of line [s, s+len), validate quoting and fill the fields.

@@ -1716,6 +1716,7 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     run("masks", &|| scan::bench_masks(&buf, start, end));
     run("validate7", &|| scan::bench_validate::<7>(&buf, start, end));
     run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += f[0].len() as u64); c });
+    run("lines4", &|| { let mut c = 0u64; scan::lines::<4>(&buf, start, end, |f| c += f[0].len() as u64); c });
     run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
     run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
     run("ingestF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(tf.parse(f[3]).unwrap_or(0) as u64)); c });
