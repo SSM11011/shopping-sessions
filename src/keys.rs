@@ -39,7 +39,8 @@ static LONG_TABLE: OnceLock<Long> = OnceLock::new();
 /// Sizes the long-ID table for about `expected` distinct long IDs (load <= ~2/3). Call once, before
 /// any key is made; without it long IDs use the general interner.
 pub fn init_long(expected: usize) {
-    let cap = (expected * 3 / 2 + 1024).next_power_of_two();
+    // slot indices fit SLOT_BITS (keys carry the ID's ordering prefix above them)
+    let cap = (expected * 3 / 2 + 1024).next_power_of_two().min(1 << SLOT_BITS);
     // fresh anonymous mapping: zero pages (all-zero = empty slot), no fill pass. Huge pages: 4 KB
     // first-touch faults from 8 threads at random slots contend on the mm lock (0.3 s sys at 20M).
     const HUGE: usize = 2 << 20;
@@ -91,6 +92,17 @@ fn long_slot0(pre: u8, hi: u64, lo: u64) -> usize {
     (x ^ (x >> 32)) as usize
 }
 
+/// A table key is EXOTIC | LONG | ord36 << SLOT_BITS | slot: ord36 packs the ID's first 6 bytes as
+/// 6-bit codes (as `pack` does), so most comparisons need no table read (see `cmp_slow`).
+const SLOT_BITS: u32 = 25;
+
+#[inline(always)]
+fn ord36(pre: u8, hi: u64) -> u64 {
+    // prefix letter code, then hex digit n -> code n + 1
+    let n = |i: u32| ((hi >> (60 - 4 * i)) & 15) + 1;
+    (CODE[pre as usize] as u64) << 30 | n(0) << 24 | n(1) << 18 | n(2) << 12 | n(3) << 6 | n(4)
+}
+
 /// Key for a long hex ID given as (prefix byte, 128-bit value), or None -> general interner.
 #[inline]
 fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
@@ -98,6 +110,7 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
     if hi <= BUSY {
         return None;
     }
+    let ord = ord36(pre, hi) << SLOT_BITS;
     let mut i = long_slot0(pre, hi, lo) & t.mask;
     for _ in 0..MAX_PROBE {
         let sl = unsafe { t.slots.get_unchecked(i) };
@@ -108,7 +121,7 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
                     sl.lo.store(lo, Relaxed);
                     sl.pre.store(pre as u64, Relaxed);
                     sl.hi.store(hi, Release);
-                    return Some(EXOTIC | LONG | i as u64);
+                    return Some(EXOTIC | LONG | ord | i as u64);
                 }
                 Err(x) => h = x,
             }
@@ -118,7 +131,7 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
             h = sl.hi.load(Acquire);
         }
         if h == hi && sl.lo.load(Relaxed) == lo && sl.pre.load(Relaxed) == pre as u64 {
-            return Some(EXOTIC | LONG | i as u64);
+            return Some(EXOTIC | LONG | ord | i as u64);
         }
         i = (i + 1) & t.mask;
     }
@@ -163,7 +176,7 @@ fn long_parts(k: u64) -> (u8, u64, u64) {
         return (b'a' + ((k >> 56) & 31) as u8, hi, lo);
     }
     let t = LONG_TABLE.get().expect("long key without table");
-    let sl = &t.slots[(k & !(EXOTIC | LONG)) as usize];
+    let sl = &t.slots[(k & ((1 << SLOT_BITS) - 1)) as usize];
     (sl.pre.load(Relaxed) as u8, sl.hi.load(Relaxed), sl.lo.load(Relaxed))
 }
 
@@ -474,6 +487,22 @@ pub fn cmp_key(a: u64, b: u64) -> Ordering {
 
 fn cmp_slow(a: u64, b: u64) -> Ordering {
     // two long hex IDs: hex digits sort like their values, so (prefix, hi, lo) is byte order
+    // table keys order by their 6-byte prefix first (canonical keys: the top 36 of their 60 bits);
+    // only an equal prefix needs the table
+    let ord = |k: u64| -> Option<u64> {
+        if k & EXOTIC == 0 {
+            Some(k >> 24)
+        } else if k & (LONG | LV) == LONG {
+            Some((k >> SLOT_BITS) & ((1 << 36) - 1))
+        } else {
+            None
+        }
+    };
+    if let (Some(x), Some(y)) = (ord(a), ord(b)) {
+        if x != y {
+            return x.cmp(&y);
+        }
+    }
     if a & b & LONG != 0 {
         return long_parts(a).cmp(&long_parts(b));
     }
@@ -569,6 +598,15 @@ mod tests {
         words.push(b"u00000000000000000000000000000000".to_vec());
         words.push(b"u0000000000000000ffffffffffffffff".to_vec());
         words.push(b"u4k2nn2cj".to_vec());
+        // equal 6-byte prefixes across canonical and long IDs (the table-key ordering prefix ties)
+        for w in [
+            &b"u00000"[..], b"u000001", b"u0000000000", b"u00000000000000000000000000000001", b"u0000f", b"u0000g",
+            b"u0000f00000000000000000000000000a", b"u0000f0000000000000000000000000b0", b"u0000f0", b"u0000fzzzz", b"u0000",
+        ] {
+            for _ in 0..40 {
+                words.push(w.to_vec());
+            }
+        }
         words.push(b"uffffffffffffffffffffffffffffffff".to_vec());
         let keys: Vec<u64> = words.iter().map(|w| key(w)).collect();
         for (w, &k) in words.iter().zip(&keys) {
@@ -582,6 +620,12 @@ mod tests {
                 let (a, b) = (i, (i * 7 + j * 13) % words.len());
                 assert_eq!(cmp_key(keys[a], keys[b]), words[a].cmp(&words[b]));
                 assert_eq!(keys[a] == keys[b], words[a] == words[b]);
+            }
+        }
+        let tail = words.len() - 600;
+        for a in tail..words.len() {
+            for b in tail..words.len() {
+                assert_eq!(cmp_key(keys[a], keys[b]), words[a].cmp(&words[b]), "{:?} {:?}", words[a], words[b]);
             }
         }
     }
