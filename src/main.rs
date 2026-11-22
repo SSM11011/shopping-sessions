@@ -791,7 +791,7 @@ fn main() {
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1) as usize;
     let ncol = n_camp + 1; // + organic
     let results: Vec<Mutex<WorkerOut>> =
-        (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp, est_rows / 8 / threads + 1024))).collect();
+        (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp, (est_rows / 8 / threads + 1024).min(2 * FLUSH_ROWS)))).collect();
     let mut order: Vec<(usize, usize)> =
         (0..nparts).map(|t| (pe_src.iter().map(|s| s.len(t)).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
@@ -870,11 +870,20 @@ fn main() {
         wo.cb = cb;
         wo.evs = evs;
         wo.cks = cks;
+        // spread output writing over the stage: flush a file every ~64k rows (keeps the final tail short)
+        if wo.day.len() >= FLUSH_ROWS {
+            let k = wo.files;
+            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), wo, &cat_names);
+            wo.clear_rows();
+            wo.files += 1;
+        }
     }, |w| {
-        // this worker is done: write its user_daily file now, overlapping the others' session work
-        let wo = results[w].lock().unwrap();
-        if !wo.day.is_empty() || w == 0 {
-            out::write_user(&ud_dir.join(format!("part-{w:05}.parquet")), &wo, &cat_names);
+        // this worker is done: write what is left (worker 0 always writes, so the folder is never empty)
+        let mut wo = results[w].lock().unwrap();
+        if !wo.day.is_empty() || (w == 0 && wo.files == 0) {
+            let k = wo.files;
+            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), &wo, &cat_names);
+            wo.files += 1;
         }
     });
     let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap()).collect();
@@ -1110,6 +1119,8 @@ fn parse_price(s: &[u8]) -> Option<u32> {
     if v == 0 { None } else { Some(v as u32) }
 }
 
+const FLUSH_ROWS: usize = 64 << 10;
+
 pub struct WorkerOut {
     pub names: Vec<u8>,
     pub name_end: Vec<u32>,
@@ -1135,6 +1146,8 @@ pub struct WorkerOut {
     eb: Vec<u32>,
     cb: Vec<u32>,
     scratch: Vec<Pe>,
+    /// user_daily files written so far by this worker
+    files: usize,
 }
 
 impl WorkerOut {
@@ -1162,9 +1175,20 @@ impl WorkerOut {
             eb: Vec::new(),
             cb: Vec::new(),
             scratch: Vec::new(),
+            files: 0,
         }
     }
     /// Campaign c gains a click in the window just before the session on day `day` is counted.
+    fn clear_rows(&mut self) {
+        self.names.clear();
+        self.name_end.clear();
+        self.day.clear();
+        self.sessions.clear();
+        self.events.clear();
+        self.revenue.clear();
+        self.top.clear();
+    }
+
     #[inline(always)]
     fn add(&mut self, c: u32, day: usize) {
         let c = c as usize;
