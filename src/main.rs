@@ -1012,6 +1012,8 @@ fn main() {
         }
         let n_ck: usize = ck_parts.iter().map(|s| s.len(t)).sum();
         radix_coarse(ck_parts.iter().map(|s| (s, t)), n_ck, &bucket, bmask + 1, ck_tsh, &mut cb, &mut cks, &mut wo.ck_scratch);
+        let mut gs_ev = std::mem::take(&mut wo.scratch);
+        let mut gs_ck = std::mem::take(&mut wo.ck_scratch);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
             if ev.is_empty() {
@@ -1022,7 +1024,22 @@ fn main() {
             // so an unstable sort gives the same result as the stable one, without its scratch allocation
             if ev.len() > 1 {
                 if ev.iter().any(|e| e.person != ev[0].person) {
-                    ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                    // a few persons share the bucket: stable grouping keeps each one's (coarse) ts order
+                    if group_stable(ev, |e| e.person, &mut gs_ev) {
+                        if coarse {
+                            let mut i = 0;
+                            while i < ev.len() {
+                                let mut j = i + 1;
+                                while j < ev.len() && ev[j].person == ev[i].person {
+                                    j += 1;
+                                }
+                                insertion_sort_ts(&mut ev[i..j]);
+                                i = j;
+                            }
+                        }
+                    } else {
+                        ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                    }
                 } else if coarse {
                     // sorted by ts >> COARSE only: finish by exact ts (only events sharing a ~2 s unit can be
                     // out of order, so this is near-linear)
@@ -1034,6 +1051,16 @@ fn main() {
                 if ck.iter().all(|c| c.user == ck[0].user) {
                     // one person (the common case): already ordered by ts >> ck_tsh
                     fix_click_runs(ck, ck_tsh);
+                } else if group_stable(ck, |c| c.user, &mut gs_ck) {
+                    let mut i = 0;
+                    while i < ck.len() {
+                        let mut j = i + 1;
+                        while j < ck.len() && ck[j].user == ck[i].user {
+                            j += 1;
+                        }
+                        fix_click_runs(&mut ck[i..j], ck_tsh);
+                        i = j;
+                    }
                 } else if ck.iter().all(|c| c.click & keys::EXOTIC == 0) {
                     // canonical click ids compare as integers: one packed 128-bit key (user, ts, click)
                     ck.sort_unstable_by_key(|c| ((c.user as u128) << 64) | ((c.ts as u128) << 32) | (c.click >> 28) as u128);
@@ -1075,6 +1102,8 @@ fn main() {
                 i = j;
             }
         }
+        wo.scratch = gs_ev;
+        wo.ck_scratch = gs_ck;
         wo.eb = eb;
         wo.cb = cb;
         wo.evs = evs;
@@ -1114,9 +1143,9 @@ fn main() {
                 a[3] += x as i64;
             }
             for (a, b) in camp_acc.iter_mut().zip(&r.camp) {
-                for k in 0..4 {
-                    a[k] += b[k];
-                }
+                a[0] += (b.sp & 0xFFFF_FFFF) as i64;
+                a[1] += (b.sp >> 32) as i64;
+                a[2] += b.rev;
             }
         }
         out::write_all(&outdir, &results, &camp_acc, &camp_ids, &channels, &cat_names, ws_day, ndays, threads);
@@ -1366,6 +1395,47 @@ fn radix_coarse<'a, T: Row + 'a>(
     std::mem::swap(out, tmp);
 }
 
+/// Group `v` by key, keys ascending, keeping the relative order of each key's elements. false (and `v`
+/// untouched) when it holds more than 8 distinct keys.
+#[inline]
+fn group_stable<T: Copy>(v: &mut [T], key: impl Fn(&T) -> u64, tmp: &mut Vec<T>) -> bool {
+    let mut ks = [0u64; 8];
+    let mut cnt = [0usize; 8];
+    let mut k = 0;
+    for e in v.iter() {
+        let x = key(e);
+        match ks[..k].iter().position(|&y| y == x) {
+            Some(i) => cnt[i] += 1,
+            None => {
+                if k == 8 {
+                    return false;
+                }
+                ks[k] = x;
+                cnt[k] = 1;
+                k += 1;
+            }
+        }
+    }
+    // destination offsets in key order
+    let mut ord: [usize; 8] = [0, 1, 2, 3, 4, 5, 6, 7];
+    ord[..k].sort_unstable_by_key(|&i| ks[i]);
+    let mut pos = [0usize; 8];
+    let mut s = 0;
+    for &i in &ord[..k] {
+        pos[i] = s;
+        s += cnt[i];
+    }
+    tmp.clear();
+    tmp.extend_from_slice(v);
+    for e in tmp.iter() {
+        let x = key(e);
+        let i = ks[..k].iter().position(|&y| y == x).unwrap();
+        v[pos[i]] = *e;
+        pos[i] += 1;
+    }
+    true
+}
+
 /// One person's clicks ordered by ts >> tsh: order each equal-coarse run by (ts, click id).
 #[inline]
 fn fix_click_runs(ck: &mut [Ck], tsh: u32) {
@@ -1484,6 +1554,14 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 const FLUSH_ROWS: usize = 64 << 10;
 const DIRECT_CKS: usize = 32;
 
+/// Credited sessions of one (campaign, day) in one worker: 16 bytes (the per-worker table stays well
+/// inside L2). sp = sessions | purchasing sessions << 32.
+#[derive(Clone, Copy)]
+pub struct CampCell {
+    sp: u64,
+    rev: i64,
+}
+
 pub struct WorkerOut {
     /// user_id dictionary of the current file: one name per person (rows of a person are contiguous)
     pub names: Vec<u8>,
@@ -1496,7 +1574,7 @@ pub struct WorkerOut {
     pub events: Vec<i32>,
     pub revenue: Vec<i64>,
     pub top: Vec<u32>, // u32::MAX = null
-    pub camp: Vec<[i64; 4]>,
+    pub camp: Vec<CampCell>,
     /// assisted-session counts, [campaign * ndays + day] (dense, cache-friendly)
     pub assist: Vec<u32>,
     count: Vec<u32>,
@@ -1533,7 +1611,7 @@ impl WorkerOut {
             events: Vec::with_capacity(rows),
             revenue: Vec::with_capacity(rows),
             top: Vec::with_capacity(rows),
-            camp: vec![[0; 4]; cells],
+            camp: vec![CampCell { sp: 0, rev: 0 }; cells],
             assist: vec![0; cells],
             count: vec![0; n_camp],
             pos: vec![0; n_camp],
@@ -1717,10 +1795,9 @@ fn person_sessions(
         } else {
             n_camp
         };
-        let cell = &mut wo.camp[credit * ndays + di];
-        cell[0] += 1;
-        cell[1] += purchased as i64;
-        cell[2] += rev;
+        let cell = unsafe { wo.camp.get_unchecked_mut(credit * ndays + di) };
+        cell.sp += 1 | ((purchased as u64) << 32);
+        cell.rev += rev;
         // count this session; active campaigns are credited in bulk when they deactivate
         if !direct {
             wo.cum[di] += 1;
@@ -1862,6 +1939,34 @@ mod tests {
             v.sort_by_key(|c| c.ts >> tsh);
             fix_click_runs(&mut v, tsh);
             assert!(v.iter().zip(&want).all(|(a, b)| a.ts == b.ts && a.click == b.click));
+        }
+    }
+
+    #[test]
+    fn group_stable_groups() {
+        let mut x: u64 = 11;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut tmp = Vec::new();
+        for case in 0..500 {
+            let n = (rnd() % 300) as usize;
+            let k = 1 + (case % 11) as u64;
+            let v: Vec<(u64, u32)> = (0..n).map(|i| (rnd() % k * 1000, i as u32)).collect();
+            let mut g = v.clone();
+            let ok = group_stable(&mut g, |e| e.0, &mut tmp);
+            let distinct = { let mut d: Vec<u64> = v.iter().map(|e| e.0).collect(); d.sort(); d.dedup(); d.len() };
+            assert_eq!(ok, distinct <= 8);
+            if ok {
+                let mut want = v.clone();
+                want.sort_by_key(|e| e.0); // stable
+                assert_eq!(g, want);
+            } else {
+                assert_eq!(g, v);
+            }
         }
     }
 
