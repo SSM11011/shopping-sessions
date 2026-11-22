@@ -933,6 +933,8 @@ fn main() {
     let bbits: u32 = std::env::var("SESSIONS_BBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(14);
     // 2 radix passes on ts >> COARSE (+ a near-linear fix-up) when every event ts offset fits in 31 bits
     let coarse = std::env::var_os("SESSIONS_FINE_RADIX").is_none() && we - ws <= 1i64 << 31;
+    // clicks: the same 2-digit coarse radix, on ts >> ck_tsh (click ts offsets span the window + 7 days)
+    let ck_tsh = (64 - ((we - ws + WEEK) as u64).leading_zeros()).saturating_sub(20);
     let ud_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&ud_dir).expect("mkdir");
     run_parallel_fin(threads, nparts, |w, t| {
@@ -951,11 +953,12 @@ fn main() {
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
         if coarse {
-            radix_events_coarse(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+            radix_coarse(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, COARSE, &mut eb, &mut evs, &mut wo.scratch);
         } else {
             radix_events(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
         }
-        bucket_scatter(ck_parts.iter().map(|v| (v, t)), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
+        let n_ck: usize = ck_parts.iter().map(|s| s.len(t)).sum();
+        radix_coarse(ck_parts.iter().map(|s| (s, t)), n_ck, &bucket, bmask + 1, ck_tsh, &mut cb, &mut cks, &mut wo.ck_scratch);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
             if ev.is_empty() {
@@ -975,7 +978,10 @@ fn main() {
             }
             let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
             if ck.len() > 1 {
-                if ck.iter().all(|c| c.click & keys::EXOTIC == 0) {
+                if ck.iter().all(|c| c.user == ck[0].user) {
+                    // one person (the common case): already ordered by ts >> ck_tsh
+                    fix_click_runs(ck, ck_tsh);
+                } else if ck.iter().all(|c| c.click & keys::EXOTIC == 0) {
                     // canonical click ids compare as integers: one packed 128-bit key (user, ts, click)
                     ck.sort_unstable_by_key(|c| ((c.user as u128) << 64) | ((c.ts as u128) << 32) | (c.click >> 28) as u128);
                     // the key above drops the click id's low 28 bits; fix the (rare) equal-prefix ties exactly
@@ -1188,16 +1194,54 @@ fn insertion_sort_ts(v: &mut [Pe]) {
     }
 }
 
-/// `radix_events` for ts < 2^31 that orders by (bucket, ts >> COARSE) only: 3 scatter passes instead of 4
-/// (two 10-bit digits of ts >> 11, then the bucket). Same output layout and bucket offsets.
-fn radix_events_coarse<'a>(
-    srcs: impl Iterator<Item = (&'a Parts<Pe>, usize)> + Clone,
+/// A row with a u32 timestamp and a person key (for `radix_coarse`).
+trait Row: Copy {
+    fn ts(&self) -> u32;
+    fn key(&self) -> u64;
+    /// false = drop (an event kept only for dedup)
+    fn live(&self) -> bool;
+}
+impl Row for Pe {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.ts
+    }
+    #[inline(always)]
+    fn key(&self) -> u64 {
+        self.person
+    }
+    #[inline(always)]
+    fn live(&self) -> bool {
+        self.ts != NO_TS
+    }
+}
+impl Row for Ck {
+    #[inline(always)]
+    fn ts(&self) -> u32 {
+        self.ts
+    }
+    #[inline(always)]
+    fn key(&self) -> u64 {
+        self.user
+    }
+    #[inline(always)]
+    fn live(&self) -> bool {
+        true
+    }
+}
+
+/// `radix_events` for ts < 2^(tsh + 20) that orders by (bucket, ts >> tsh) only: 3 scatter passes instead
+/// of 4 (two 10-bit digits of ts >> tsh, then the bucket). Same output layout and bucket offsets.
+#[allow(clippy::too_many_arguments)]
+fn radix_coarse<'a, T: Row + 'a>(
+    srcs: impl Iterator<Item = (&'a Parts<T>, usize)> + Clone,
     n: usize,
     bucket: &impl Fn(u64) -> usize,
     nb: usize,
+    tsh: u32,
     starts: &mut Vec<u32>,
-    out: &mut Vec<Pe>,
-    tmp: &mut Vec<Pe>,
+    out: &mut Vec<T>,
+    tmp: &mut Vec<T>,
 ) {
     let mut h0 = [0u32; 1024];
     let mut h1 = [0u32; 1024];
@@ -1211,14 +1255,14 @@ fn radix_events_coarse<'a>(
     for (b, bt) in srcs.clone() {
         b.for_each_slice(bt, |sl| {
             for e in sl {
-                let ts = e.ts;
-                if ts == NO_TS {
+                if !e.live() {
                     continue;
                 }
+                let ts = e.ts();
                 live += 1;
-                h0[((ts >> COARSE) & 1023) as usize] += 1;
-                h1[((ts >> (COARSE + 10)) & 1023) as usize] += 1;
-                starts[bucket(e.person) + 1] += 1;
+                h0[((ts >> tsh) & 1023) as usize] += 1;
+                h1[((ts >> (tsh + 10)) & 1023) as usize] += 1;
+                starts[bucket(e.key()) + 1] += 1;
             }
         });
     }
@@ -1242,10 +1286,10 @@ fn radix_events_coarse<'a>(
         for (b, bt) in srcs {
             b.for_each_slice(bt, |sl| {
                 for e in sl {
-                    if e.ts == NO_TS {
+                    if !e.live() {
                         continue;
                     }
-                    let k = ((e.ts >> COARSE) & 1023) as usize;
+                    let k = ((e.ts() >> tsh) & 1023) as usize;
                     *t.add(h0[k] as usize) = *e;
                     h0[k] += 1;
                 }
@@ -1253,14 +1297,14 @@ fn radix_events_coarse<'a>(
         }
         for i in 0..n {
             let e = *t.add(i);
-            let k = ((e.ts >> (COARSE + 10)) & 1023) as usize;
+            let k = ((e.ts() >> (tsh + 10)) & 1023) as usize;
             *o.add(h1[k] as usize) = e;
             h1[k] += 1;
         }
         let mut pos: Vec<u32> = starts[..nb].to_vec();
         for i in 0..n {
             let e = *o.add(i);
-            let k = bucket(e.person);
+            let k = bucket(e.key());
             *t.add(pos[k] as usize) = e;
             pos[k] += 1;
         }
@@ -1269,43 +1313,36 @@ fn radix_events_coarse<'a>(
     std::mem::swap(out, tmp);
 }
 
-fn bucket_scatter<'a, T: Copy + 'a>(
-    srcs: impl Iterator<Item = (&'a Parts<T>, usize)> + Clone,
-    key: impl Fn(&T) -> usize,
-    nb: usize,
-    starts: &mut Vec<u32>,
-    out: &mut Vec<T>,
-) {
-    starts.clear();
-    starts.resize(nb + 1, 0);
-    let mut n = 0usize;
-    for (b, bt) in srcs.clone() {
-        b.for_each_slice(bt, |sl| {
-            n += sl.len();
-            for e in sl {
-                starts[key(e) + 1] += 1;
+/// One person's clicks ordered by ts >> tsh: order each equal-coarse run by (ts, click id).
+#[inline]
+fn fix_click_runs(ck: &mut [Ck], tsh: u32) {
+    let lt = |a: &Ck, b: &Ck| a.ts < b.ts || (a.ts == b.ts && cmp_key(a.click, b.click).is_lt());
+    let mut i = 0;
+    while i + 1 < ck.len() {
+        let c = ck[i].ts >> tsh;
+        let mut j = i + 1;
+        while j < ck.len() && ck[j].ts >> tsh == c {
+            j += 1;
+        }
+        if j - i > 1 {
+            let r = &mut ck[i..j];
+            if r.len() <= 24 {
+                for a in 1..r.len() {
+                    let x = r[a];
+                    let mut b = a;
+                    while b > 0 && lt(&x, &r[b - 1]) {
+                        r[b] = r[b - 1];
+                        b -= 1;
+                    }
+                    r[b] = x;
+                }
+            } else {
+                r.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| cmp_key(a.click, b.click)));
             }
-        });
+        }
+        i = j;
     }
-    for i in 0..nb {
-        starts[i + 1] += starts[i];
-    }
-    out.clear();
-    out.reserve(n);
-    let dst = out.as_mut_ptr();
-    let mut pos: Vec<u32> = starts[..nb].to_vec();
-    for (b, bt) in srcs {
-        b.for_each_slice(bt, |sl| {
-            for e in sl {
-                let k = key(e);
-                unsafe { *dst.add(pos[k] as usize) = *e };
-                pos[k] += 1;
-            }
-        });
-    }
-    unsafe { out.set_len(n) };
 }
-
 
 /// An event line -> dedup candidate (None if the event_id is empty).
 #[inline(always)]
@@ -1422,6 +1459,7 @@ pub struct WorkerOut {
     eb: Vec<u32>,
     cb: Vec<u32>,
     scratch: Vec<Pe>,
+    ck_scratch: Vec<Ck>,
     /// user_daily files written so far by this worker
     files: usize,
 }
@@ -1453,6 +1491,7 @@ impl WorkerOut {
             eb: Vec::new(),
             cb: Vec::new(),
             scratch: Vec::new(),
+            ck_scratch: Vec::new(),
             files: 0,
         }
     }
@@ -1737,6 +1776,30 @@ mod tests {
             v.sort_by_key(|e| e.ts >> COARSE);
             insertion_sort_ts(&mut v);
             assert!(v.windows(2).all(|w| w[0].ts <= w[1].ts));
+        }
+    }
+
+    #[test]
+    fn click_fixup_sorts() {
+        let mut x: u64 = 7;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..300 {
+            let n = (rnd() % 200) as usize;
+            let tsh = (case % 4) as u32 * 5;
+            let span = 1 + rnd() % 5000;
+            let mut v: Vec<Ck> = (0..n)
+                .map(|_| Ck { user: 1, click: (rnd() % 50) << 40, ts: (rnd() % span) as u32, camp: 0 })
+                .collect();
+            let mut want = v.clone();
+            want.sort_by(|a, b| a.ts.cmp(&b.ts).then(a.click.cmp(&b.click)));
+            v.sort_by_key(|c| c.ts >> tsh);
+            fix_click_runs(&mut v, tsh);
+            assert!(v.iter().zip(&want).all(|(a, b)| a.ts == b.ts && a.click == b.click));
         }
     }
 
