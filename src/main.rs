@@ -852,12 +852,43 @@ fn main() {
     let dkl_in: Vec<Parts<DkL>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dkl)).collect();
     let pe_src: Vec<Parts<Pe>> = outs.into_iter().map(|o| o.pe).collect();
     let bases: Vec<usize> = arenas.iter().map(|a| a.base() as usize).collect();
-    let kill = |r: u32| {
-        if r != NO_REF {
-            let p = (bases[(r >> 28) as usize] + (((r & ((1 << 28) - 1)) as usize) << 4)) as *mut Pe;
-            unsafe { std::ptr::addr_of_mut!((*p).ts).write(NO_TS) };
+    // a killed row is a random line in some arena: prefetch it now and write it KR kills later, so the
+    // misses overlap instead of stalling the probe loop one by one
+    const KR: usize = 16;
+    struct Kills<'b> {
+        bases: &'b [usize],
+        ring: [usize; KR],
+        n: usize,
+    }
+    impl Kills<'_> {
+        #[inline(always)]
+        fn kill(&mut self, r: u32) {
+            if r == NO_REF {
+                return;
+            }
+            let p = self.bases[(r >> 28) as usize] + (((r & ((1 << 28) - 1)) as usize) << 4);
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                std::arch::x86_64::_mm_prefetch(p as *const i8, std::arch::x86_64::_MM_HINT_T0);
+            }
+            let slot = self.n % KR;
+            if self.n >= KR {
+                Self::write(self.ring[slot]);
+            }
+            self.ring[slot] = p;
+            self.n += 1;
         }
-    };
+        #[inline(always)]
+        fn write(p: usize) {
+            unsafe { std::ptr::addr_of_mut!((*(p as *mut Pe)).ts).write(NO_TS) };
+        }
+        fn flush(&mut self) {
+            for k in self.n.saturating_sub(KR)..self.n {
+                Self::write(self.ring[k % KR]);
+            }
+            self.n = 0;
+        }
+    }
     struct Stage2 {
         segs: Vec<(*const Dk, usize)>,
         table: Vec<u32>,
@@ -868,6 +899,7 @@ fn main() {
     run_parallel(threads, nparts, |w, t| {
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
+        let mut kills = Kills { bases: &bases, ring: [0; KR], n: 0 };
         // keys stay where parsing put them (index = segment << 10 | offset); slot = 8-bit fingerprint << 24 |
         // (index + 1), 0 = empty: 4-byte slots keep the table half the size (cache-resident at 60M), and a
         // different event in a slot is still rejected without reading its key 255 times in 256
@@ -885,18 +917,25 @@ fn main() {
         let table = &mut st.table;
         let at = |idx: usize| -> &Dk { unsafe { &*segs.get_unchecked(idx >> 10).0.add(idx & 1023) } };
         const DPF: usize = 8;
+        // hashes computed once, DPF keys ahead (when the slot is prefetched)
+        let mut hr = [0u64; 16];
         for (si, &(p, len)) in segs.iter().enumerate() {
             let sl = unsafe { std::slice::from_raw_parts(p, len) };
+            for k in 0..DPF.min(len) {
+                hr[k] = hash(sl[k].eid);
+            }
             for (off, e) in sl.iter().enumerate() {
                 if off + DPF < len {
-                    let j = (hash(unsafe { sl.get_unchecked(off + DPF) }.eid) as usize >> 3) & mask;
+                    let hn = hash(unsafe { sl.get_unchecked(off + DPF) }.eid);
+                    hr[(off + DPF) & 15] = hn;
+                    let j = (hn as usize >> 3) & mask;
                     #[cfg(target_arch = "x86_64")]
                     unsafe {
                         std::arch::x86_64::_mm_prefetch(table.as_ptr().add(j) as *const i8, std::arch::x86_64::_MM_HINT_T0);
                     }
                 }
                 let idx = (si << 10) | off;
-                let h = hash(e.eid);
+                let h = hr[off & 15];
                 let fp = ((h >> 56) as u32) << 24;
                 let me = fp | (idx as u32 + 1);
                 let mut i = (h as usize >> 3) & mask;
@@ -910,10 +949,10 @@ fn main() {
                         let o = at((s & 0xFF_FFFF) as usize - 1);
                         if o.eid == e.eid {
                             if e.ingest < o.ingest {
-                                kill(o.r);
+                                kills.kill(o.r);
                                 table[i] = me;
                             } else {
-                                kill(e.r);
+                                kills.kill(e.r);
                             }
                             break;
                         }
@@ -955,10 +994,10 @@ fn main() {
                             let o = at((s & 0xFF_FFFF) as usize - 1);
                             if o.hi == e.hi && o.lo == e.lo && o.pre == e.pre {
                                 if e.ingest < o.ingest {
-                                    kill(o.r);
+                                    kills.kill(o.r);
                                     table[i] = me;
                                 } else {
-                                    kill(e.r);
+                                    kills.kill(e.r);
                                 }
                                 break;
                             }
@@ -968,6 +1007,7 @@ fn main() {
                 }
             }
         }
+        kills.flush();
     });
     drop(dk_in);
     drop(dkl_in);
