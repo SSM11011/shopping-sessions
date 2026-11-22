@@ -85,7 +85,29 @@ pub fn split<'a, const N: usize>(line: &'a [u8], out: &mut [&'a [u8]; N]) -> boo
     }
 }
 
-#[cfg(target_feature = "avx2")]
+/// AVX-512BW: one 64-byte load, three compares straight into 64-bit masks (bit i = byte i).
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm512_loadu_si512(p.cast());
+        (
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8)),
+            _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8)),
+        )
+    }
+}
+
+#[cfg(target_feature = "avx512bw")]
+#[inline(always)]
+unsafe fn nl64(p: *const u8) -> u64 {
+    use std::arch::x86_64::*;
+    unsafe { _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(p.cast()), _mm512_set1_epi8(b'\n' as i8)) }
+}
+
+#[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     use std::arch::x86_64::*;
@@ -116,7 +138,7 @@ unsafe fn masks64(p: *const u8) -> (u64, u64, u64) {
     (n, c, q)
 }
 
-#[cfg(target_feature = "avx2")]
+#[cfg(all(target_feature = "avx2", not(target_feature = "avx512bw")))]
 #[inline(always)]
 unsafe fn nl64(p: *const u8) -> u64 {
     use std::arch::x86_64::*;

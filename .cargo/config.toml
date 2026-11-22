@@ -1,2 +1,4 @@
 [build]
-rustflags = ["-C", "target-cpu=x86-64-v3"]
+# explicit target: rustflags then apply to the binary only, not to build scripts run on the build host
+target = "x86_64-unknown-linux-gnu"
+rustflags = ["-C", "target-cpu=x86-64-v3", "-C", "target-feature=+avx512f,+avx512bw,+prefer-256-bit"]
