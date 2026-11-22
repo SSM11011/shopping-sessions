@@ -74,7 +74,7 @@ fn civil(s: &[u8]) -> Option<i64> {
 pub fn parse(s: &[u8]) -> Option<i64> {
     match s.len() {
         20 if s[19] == b'Z' => civil(s),
-        25 => {
+        25 if s[10] == b'T' => {
             let base = civil(s)?;
             let sign = s[19];
             if (sign != b'+' && sign != b'-') || s[22] != b':' {
@@ -179,7 +179,7 @@ impl Fast {
         match s.len() {
             20 => {
                 if s[10] != b'T' || s[19] != b'Z' {
-                    return None;
+                    return parse(s);
                 }
                 let days = self.date(s)?;
                 let tod = time_of_day(s)?;
@@ -191,7 +191,7 @@ impl Fast {
             },
             25 => {
                 if s[10] != b'T' {
-                    return None;
+                    return parse(s);
                 }
                 let days = self.date(s)?;
                 let tod = time_of_day(s)?;
@@ -253,6 +253,18 @@ mod tests {
         assert!(parse(b"2028-02-29T00:00:00Z").is_some());
         assert_eq!(parse(b"2026-10-03T23:58:10-00:00"), Some(f1));
         assert_eq!(parse(b"86400000"), Some(86_400_000));
+    }
+
+    #[test]
+    fn f3_with_f1_f2_lengths() {
+        // 20 and 25 characters are also the F1/F2 lengths; all-digit values of those lengths are F3
+        let mut fast = Fast::default();
+        for s in [&b"00000001791071890000"[..], b"0000000000001791071890000"] {
+            assert_eq!(parse(s), Some(1791071890000));
+            assert_eq!(fast.parse(s), Some(1791071890000));
+        }
+        assert_eq!(fast.parse(b"0000000179107189000x"), None);
+        assert_eq!(fast.parse(b"000000000000179107189000x"), None);
     }
 
     #[test]

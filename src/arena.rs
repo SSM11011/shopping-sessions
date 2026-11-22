@@ -73,6 +73,12 @@ fn thp_budget() -> u64 {
 
 impl Arena {
     pub fn new(cap: usize) -> Self {
+        Self::try_new(cap).expect("arena reservation failed")
+    }
+
+    /// Reserves `cap` bytes of address space; None if the kernel refuses (e.g. strict overcommit
+    /// accounting, which ignores MAP_NORESERVE, or an address-space limit).
+    pub fn try_new(cap: usize) -> Option<Self> {
         let cap = (cap + (2 << 20) - 1) & !((2 << 20) - 1);
         unsafe {
             let p = libc::mmap(
@@ -83,13 +89,14 @@ impl Arena {
                 -1,
                 0,
             );
-            // payload rows are addressed relative to the arena base, so a missing arena is fatal
-            assert!(p != libc::MAP_FAILED, "arena reservation failed");
+            if p == libc::MAP_FAILED {
+                return None;
+            }
             let huge = (thp_budget().min(cap as u64)) as usize;
             if huge > 0 {
                 libc::madvise(p, huge, libc::MADV_HUGEPAGE);
             }
-            Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), huge_end: AtomicUsize::new(huge), free: Default::default() }
+            Some(Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), huge_end: AtomicUsize::new(huge), free: Default::default() })
         }
     }
 
@@ -155,8 +162,8 @@ impl Arena {
             }
             p
         } else {
-            let layout = std::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
-            unsafe { std::alloc::alloc(layout) }
+            // rows are addressed by arena offset (dedup refs), so a heap block would corrupt them
+            panic!("arena full ({} bytes)", self.cap);
         }
     }
 
@@ -167,16 +174,22 @@ impl Arena {
         }
     }
 
-    /// Bytes, 64-aligned. Falls back to a leaked heap allocation when the arena is exhausted.
+    /// Bytes, 64-aligned.
     fn alloc(&self, bytes: usize) -> *mut u8 {
         let at = (self.used.load(Relaxed) + 63) & !63;
         if at + bytes <= self.cap {
             self.used.store(at + bytes, Relaxed);
             unsafe { self.base.add(at) }
         } else {
-            let layout = std::alloc::Layout::from_size_align(bytes.max(1), 64).unwrap();
-            unsafe { std::alloc::alloc(layout) }
+            panic!("arena full ({} bytes)", self.cap);
         }
+    }
+}
+
+impl Drop for Arena {
+    fn drop(&mut self) {
+        // only reached when a reservation set is abandoned; the run itself exits without dropping
+        unsafe { libc::munmap(self.base as *mut libc::c_void, self.cap) };
     }
 }
 

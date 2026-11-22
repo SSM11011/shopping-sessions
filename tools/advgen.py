@@ -16,7 +16,7 @@ def iso(ms, rnd):
     dt = datetime.datetime.fromtimestamp(ms / 1000, tz=datetime.timezone.utc)
     r = rnd.random()
     if ms % 1000 or r < 0.3:
-        z = "0" * rnd.choice([0, 0, 0, 1, 3, 20])
+        z = "0" * rnd.choice([0, 0, 0, 1, 3, 7, 12, 20])  # 7 / 12 zeros: F3 with the F1 / F2 lengths
         return z + str(ms)
     if r < 0.45:
         off = rnd.choice([-600, -330, 0, 345, 720, 23 * 60 + 59])

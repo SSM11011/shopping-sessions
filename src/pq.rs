@@ -13,8 +13,6 @@ pub enum Data<'a> {
     Str { bytes: &'a [u8], ends: &'a [u32], present: Option<&'a [bool]> },
     I32(&'a [i32]),
     I64(&'a [i64]),
-    /// i64 values that all fit in i32, stored as INT32 (4 bytes each)
-    I64As32(&'a [i64]),
 }
 
 pub struct Column<'a> {
@@ -127,7 +125,6 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
             Data::Str { present, .. } => (6, present.is_some()),
             Data::I32(_) => (1, false),
             Data::I64(_) => (2, false),
-            Data::I64As32(_) => (1, false),
         };
         let mut r0 = 0;
         // value cursor for optional strings (non-null values are stored densely)
@@ -170,11 +167,6 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
                 Data::I32(v) => {
                     for x in &v[r0..r1] {
                         page.extend_from_slice(&x.to_le_bytes());
-                    }
-                }
-                Data::I64As32(v) => {
-                    for x in &v[r0..r1] {
-                        page.extend_from_slice(&(*x as i32).to_le_bytes());
                     }
                 }
                 Data::I64(v) => {

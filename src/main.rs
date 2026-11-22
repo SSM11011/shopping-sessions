@@ -511,11 +511,15 @@ fn main() {
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
-    // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
-    // a 32-bit ref = worker << 28 | (offset / 16)
-    let _ = arena_bytes;
     arena::decide_thp(threads);
-    let arenas: Vec<Arena> = (0..threads).map(|_| Arena::new((4usize << 30) - (2 << 20))).collect();
+    // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
+    // a 32-bit ref = worker << 28 | (offset / 16). Twice the estimate is the fallback reservation.
+    let full = (4usize << 30) - (2 << 20);
+    let reserve = |sz: usize| -> Option<Vec<Arena>> { (0..threads).map(|_| Arena::try_new(sz)).collect() };
+    let arenas: Vec<Arena> = reserve(full)
+        .or_else(|| reserve((arena_bytes * 2).min(full)))
+        .or_else(|| reserve(arena_bytes.min(full)))
+        .expect("arena reservation failed");
 
 
     let ing_base: i64 = ws.div_euclid(1000) - (1i64 << 31);
