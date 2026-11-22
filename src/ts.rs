@@ -303,3 +303,124 @@ mod tests {
         }
     }
 }
+
+#[inline(never)]
+pub fn mb_parse_all(v: &[&[u8]], tf: &mut Fast) -> u64 {
+    let mut c = 0u64;
+    for s in v {
+        c = c.wrapping_add(tf.parse(s).unwrap_or(0) as u64);
+    }
+    c
+}
+
+/// 13 ASCII digits at p (16 bytes readable) -> (value, all digits).
+#[inline(always)]
+pub unsafe fn digits13p(p: *const u8) -> (i64, bool) {
+    let a = unsafe { (p as *const u64).read_unaligned() };
+    let b = (unsafe { (p.add(5) as *const u64).read_unaligned() } & !0xFF_FFFF) | 0x30_3030;
+    const D: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    let bad = ((a & D) ^ Z) | ((b & D) ^ Z) | ((a.wrapping_add(0x0606_0606_0606_0606) & D) ^ Z) | ((b.wrapping_add(0x0606_0606_0606_0606) & D) ^ Z);
+    ((parse8(a).wrapping_mul(100_000).wrapping_add(parse8(b))) as i64, bad == 0)
+}
+
+/// F2 zone at p (`+HH:MM` / `-HH:MM`, 8 bytes readable) -> (offset to add to local time in ms, valid).
+#[inline(always)]
+pub unsafe fn zone(p: *const u8) -> (i64, bool) {
+    let o = unsafe { (p as *const u64).read_unaligned() };
+    let b = |i: u32| ((o >> (8 * i)) & 0xFF) as u8;
+    let (h1, h0, m1, m0) = (b(1).wrapping_sub(b'0'), b(2).wrapping_sub(b'0'), b(4).wrapping_sub(b'0'), b(5).wrapping_sub(b'0'));
+    let oh = h1 as i64 * 10 + h0 as i64;
+    let om = m1 as i64 * 10 + m0 as i64;
+    let sign = b(0);
+    let ok = ((sign == b'+') | (sign == b'-')) & (b(3) == b':') & (h1 <= 2) & (h0 <= 9) & (m1 <= 5) & (m0 <= 9) & (oh <= 23);
+    let off = (oh * 60 + om) * 60_000;
+    (if sign == b'-' { off } else { -off }, ok)
+}
+
+impl Fast {
+    /// Local `YYYY-MM-DDTHH:MM:SS` of two fields at once (32 bytes readable at a and b), both in one
+    /// vector pass: (ms_a, ok_a, ms_b, ok_b). ok: valid time, date in the cache; byte 19 (zone) and the
+    /// length are not looked at. Then the value equals `parse`'s base before the zone.
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    pub unsafe fn local_pair(&self, a: *const u8, b: *const u8) -> (i64, bool, i64, bool) {
+        use std::arch::x86_64::*;
+        unsafe {
+            let v = _mm256_inserti128_si256::<1>(
+                _mm256_castsi128_si256(_mm_loadu_si128(a.add(4) as *const __m128i)),
+                _mm_loadu_si128(b.add(4) as *const __m128i),
+            );
+            let c8 = |x: u8| x as i8;
+            let base = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+                0, 0, 0, 0, 0, 0, c8(b'T'), c8(b'0'), c8(b'0'), c8(b':'), c8(b'0'), c8(b'0'), c8(b':'), c8(b'0'), c8(b'0'), 0,
+            ));
+            let lim = _mm256_broadcastsi128_si256(_mm_setr_epi8(-1, -1, -1, -1, -1, -1, 0, 2, 9, 0, 5, 9, 0, 5, 9, -1));
+            let x = _mm256_sub_epi8(v, base);
+            let okm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(x, lim), x)) as u32;
+            let sh = _mm256_broadcastsi128_si256(_mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+            let dg = _mm256_shuffle_epi8(x, sh);
+            let w = _mm256_maddubs_epi16(dg, _mm256_broadcastsi128_si256(_mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
+            let m = _mm256_madd_epi16(w, _mm256_broadcastsi128_si256(_mm_setr_epi16(60, 1, 1, 0, 0, 0, 0, 0)));
+            let ta = _mm256_extract_epi64::<0>(m) as u64;
+            let tb = _mm256_extract_epi64::<2>(m) as u64;
+            let (da, ha) = self.date_hit(a);
+            let (db, hb) = self.date_hit(b);
+            let (mina, minb) = (ta & 0xFFFF_FFFF, tb & 0xFFFF_FFFF);
+            let ok_a = (okm & 0xFFFF == 0xFFFF) & ha & (mina < 1440);
+            let ok_b = (okm >> 16 == 0xFFFF) & hb & (minb < 1440);
+            let ms_a = (da * 86_400 + (mina * 60 + (ta >> 32)) as i64) * SECOND;
+            let ms_b = (db * 86_400 + (minb * 60 + (tb >> 32)) as i64) * SECOND;
+            (ms_a, ok_a, ms_b, ok_b)
+        }
+    }
+
+    /// Days of a cached `YYYY-MM-DD` at p (10 bytes readable): (days, hit). Never inserts.
+    #[inline(always)]
+    unsafe fn date_hit(&self, p: *const u8) -> (i64, bool) {
+        let k8 = unsafe { (p as *const u64).read_unaligned() };
+        let k2 = unsafe { (p.add(8) as *const u16).read_unaligned() };
+        let h = (((k2 & 3) | ((k2 >> 6) & 0x3C)) as usize) | ((k8 >> 42) & 0x40) as usize;
+        let hit = unsafe { (*self.k8.get_unchecked(h) == k8) & (*self.k2.get_unchecked(h) == k2) };
+        (unsafe { *self.days.get_unchecked(h) }, hit)
+    }
+
+    /// F1 values of two fields at once (32 bytes readable at a and b), both in one vector pass.
+    /// (ms_a, ok_a, ms_b, ok_b): ok means the field is F1 with a cached date and a valid time, and then
+    /// the value equals `parse`'s; otherwise the caller must use `parse`.
+    #[cfg(target_feature = "avx2")]
+    #[inline(always)]
+    pub unsafe fn f1_pair(&self, a: *const u8, na: usize, b: *const u8, nb: usize) -> (i64, bool, i64, bool) {
+        use std::arch::x86_64::*;
+        unsafe {
+            // bytes 4..20 of each field: date tail (unchecked here: a cache hit validates the date),
+            // 'T', HH, ':', MM, ':', SS, 'Z'
+            let v = _mm256_inserti128_si256::<1>(
+                _mm256_castsi128_si256(_mm_loadu_si128(a.add(4) as *const __m128i)),
+                _mm_loadu_si128(b.add(4) as *const __m128i),
+            );
+            let c8 = |x: u8| x as i8;
+            let base = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+                0, 0, 0, 0, 0, 0, c8(b'T'), c8(b'0'), c8(b'0'), c8(b':'), c8(b'0'), c8(b'0'), c8(b':'), c8(b'0'), c8(b'0'), c8(b'Z'),
+            ));
+            let lim = _mm256_broadcastsi128_si256(_mm_setr_epi8(-1, -1, -1, -1, -1, -1, 0, 2, 9, 0, 5, 9, 0, 5, 9, 0));
+            let x = _mm256_sub_epi8(v, base);
+            let okm = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(x, lim), x)) as u32;
+            let sh = _mm256_broadcastsi128_si256(_mm_setr_epi8(7, 8, 10, 11, 13, 14, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1));
+            let dg = _mm256_shuffle_epi8(x, sh);
+            let w = _mm256_maddubs_epi16(dg, _mm256_broadcastsi128_si256(_mm_setr_epi8(10, 1, 10, 1, 10, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)));
+            // dwords: HH * 60 + MM, SS
+            let m = _mm256_madd_epi16(w, _mm256_broadcastsi128_si256(_mm_setr_epi16(60, 1, 1, 0, 0, 0, 0, 0)));
+            let ta = _mm256_extract_epi64::<0>(m) as u64;
+            let tb = _mm256_extract_epi64::<2>(m) as u64;
+            let (da, ha) = self.date_hit(a);
+            let (db, hb) = self.date_hit(b);
+            let (mina, minb) = (ta & 0xFFFF_FFFF, tb & 0xFFFF_FFFF);
+            let ok_a = (na == 20) & (okm & 0xFFFF == 0xFFFF) & ha & (mina < 1440);
+            let ok_b = (nb == 20) & (okm >> 16 == 0xFFFF) & hb & (minb < 1440);
+            let ms_a = (da * 86_400 + (mina * 60 + (ta >> 32)) as i64) * SECOND;
+            let ms_b = (db * 86_400 + (minb * 60 + (tb >> 32)) as i64) * SECOND;
+            (ms_a, ok_a, ms_b, ok_b)
+        }
+    }
+}

@@ -1,4 +1,5 @@
 mod arena;
+mod evl;
 mod keys;
 mod out;
 mod pq;
@@ -692,6 +693,7 @@ fn main() {
     const RD: usize = 8;
     const RB: usize = 12;
     let main_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind != Kind::Link).collect();
+    let pmode: u32 = std::env::var("EXP_PARSE").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
     run_parallel_fin(threads, main_tasks.len(), |w, t| {
         let task = main_tasks[t];
         let (file, flen) = &files[task.file];
@@ -736,7 +738,8 @@ fn main() {
                     }
                 }
                 scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
-                    if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
+                    let pe = match pmode { 1 => evl::parse_event_fast(&ctx, &mut o.tsf, f, ing_base), 2 => evl::parse_event_b(&ctx, &mut o.tsf, f, ing_base), _ => parse_event(&ctx, &mut o.tsf, f, ing_base) };
+                    if let Some(ev) = pe {
                         if ev.ts == NO_TS {
                             push_dk(o, arena, pshift, &ev, NO_REF);
                             return;
@@ -1890,13 +1893,24 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     let (f, len) = &files.iter().max_by_key(|x| x.1).unwrap();
     let mut buf = Vec::new();
     let (start, end) = scan::load(f, *len, 0, *len, &mut buf);
-    let n = buf[start..end].iter().filter(|&&b| b == b'\n').count();
+    // a cache-resident window (the parse works on 256 KB chunks), repeated
+    let win: usize = std::env::var("EXP_WIN").ok().and_then(|v| v.parse().ok()).unwrap_or(1 << 20);
+    let end = if start + win < end { start + win + memchr::memchr(b'\n', &buf[start + win..end]).unwrap() + 1 } else { end };
+    buf[end..end + scan::PAD].fill(0);
+    let reps = (64 << 20) / (end - start) + 1;
+    let n = buf[start..end].iter().filter(|&&b| b == b'\n').count() * reps;
+    let only = std::env::var("EXP_MICRO").unwrap_or_default();
     let run = |name: &str, g: &dyn Fn() -> u64| {
+        if only != "1" && !only.split(',').any(|x| x == name) {
+            return;
+        }
         let mut best = f64::MAX;
         let mut r = 0;
         for _ in 0..7 {
             let t = Instant::now();
-            r += g();
+            for _ in 0..reps {
+                r += g();
+            }
             best = best.min(t.elapsed().as_secs_f64());
         }
         eprintln!("{name:>10}: {:5.1} ns/line ({})", best * 1e9 / n as f64, r % 7);
@@ -1905,45 +1919,127 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     run("nl-chain", &|| scan::bench_nl(&buf, start, end));
     run("masks", &|| scan::bench_masks(&buf, start, end));
     run("validate7", &|| scan::bench_validate::<7>(&buf, start, end));
-    run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += f[0].len() as u64); c });
-    run("lines4", &|| { let mut c = 0u64; scan::lines::<4>(&buf, start, end, |f| c += f[0].len() as u64); c });
-    run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
-    run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
-    run("ingestF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(tf.parse(f[3]).unwrap_or(0) as u64)); c });
-    run("tsF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(tf.parse(f[2]).unwrap_or(0) as u64)); c });
-    run("ts", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64)); c });
-    run("product", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += ctx.products.get(f[5]).unwrap_or(0) as u64); c });
+    run("sp0", &|| evl::mb_split::<0>(&buf, start, end));
+    run("sp1", &|| evl::mb_split::<1>(&buf, start, end));
+    run("sp2", &|| evl::mb_split::<2>(&buf, start, end));
+    run("sp3", &|| evl::mb_split::<3>(&buf, start, end));
+    run("sp4", &|| evl::mb_split::<4>(&buf, start, end));
+    run("lall", &|| scan::mb_lall(&buf, start, end));
+    run("lall-old", &|| scan::mb_lall_old(&buf, start, end));
+    run("l-m4", &|| { let mut c = 0u64; scan::lines_x::<7, 4>(&buf, start, end, #[inline(always)] |f| c += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>()); c });
+    run("l-m3", &|| { let mut c = 0u64; scan::lines_x::<7, 3>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("l-m1", &|| { let mut c = 0u64; scan::lines_x::<7, 1>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("l-m2", &|| { let mut c = 0u64; scan::lines_x::<7, 2>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("lines-old", &|| { let mut c = 0u64; scan::lines_old::<7>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("lines", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("lines4", &|| { let mut c = 0u64; scan::lines::<4>(&buf, start, end, #[inline(always)] |f| c += f[0].len() as u64); c });
+    run("keys", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(key(f[0]) ^ key(f[1]))); c });
+    run("ingest", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(ts::parse(f[3]).unwrap_or(0) as u64)); c });
+    run("ingestF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(tf.parse(f[3]).unwrap_or(0) as u64)); c });
+    run("tsF", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(tf.parse(f[2]).unwrap_or(0) as u64)); c });
+    run("ts", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(ts::parse(f[2]).unwrap_or(0) as u64)); c });
+    run("product", &|| { let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c += ctx.products.get(f[5]).unwrap_or(0) as u64); c });
     let ib = _ws.div_euclid(1000) - (1i64 << 31);
-    run("event", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c = c.wrapping_add(parse_event(ctx, &mut tf, f, ib).map_or(0, |v| v.eid ^ v.user))); c });
+    let mut ings: Vec<&[u8]> = Vec::new();
+    let mut tss: Vec<&[u8]> = Vec::new();
+    scan::lines_old::<7>(&buf, start, end, |f| { ings.push(f[3]); tss.push(f[2]); });
+    let nl = ings.len();
+    let runv = |name: &str, g: &dyn Fn() -> u64| {
+        if only != "1" && !only.split(',').any(|x| x == name) {
+            return;
+        }
+        let mut best = f64::MAX;
+        for _ in 0..7 {
+            let t = Instant::now();
+            for _ in 0..reps { std::hint::black_box(g()); }
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!("{name:>10}: {:5.1} ns/item", best * 1e9 / (nl * reps) as f64);
+    };
+    let mut idp: Vec<(&[u8], &[u8])> = Vec::new();
+    scan::lines_old::<7>(&buf, start, end, |f| if f[0].len() <= 10 && f[1].len() <= 10 && !f[0].is_empty() && !f[1].is_empty() { idp.push((f[0], f[1])) });
+    runv("v-pack2", &|| evl::mb_pack2(&idp));
+    runv("v-pack16", &|| evl::mb_pack16(&idp));
+    runv("v-ing", &|| { let mut tf = ts::Fast::default(); ts::mb_parse_all(&ings, &mut tf) });
+    runv("v-ts", &|| { let mut tf = ts::Fast::default(); ts::mb_parse_all(&tss, &mut tf) });
+    run("fused", &|| { let mut tf = ts::Fast::default(); evl::mb_fused::<0>(&buf, start, end, ctx, &mut tf, ib) });
+    run("g0", &|| { let mut tf = ts::Fast::default(); evl::mb_fused2::<0>(&buf, start, end, ctx, &mut tf, ib) });
+    run("g1", &|| { let mut tf = ts::Fast::default(); evl::mb_fused2::<1>(&buf, start, end, ctx, &mut tf, ib) });
+    let shp = std::cell::RefCell::new(evl::new_shapes());
+    run("h0", &|| { let mut tf = ts::Fast::default(); evl::mb_fused3::<0>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    if only.contains("hstat") {
+        let tot = std::cell::Cell::new(0u64);
+        let mut tf = ts::Fast::default();
+        let mut sh = evl::new_shapes();
+        let nl0 = buf[start..end].iter().filter(|&&b| b == b'\n').count() as u64;
+        for _ in 0..reps { tot.set(tot.get() + nl0); evl::mb_fused3::<0>(&buf, start, end, ctx, &mut tf, &mut sh, ib); }
+        let mut kinds = [0u64; 3];
+        let _ = &mut kinds;
+        eprintln!("lines {} shape misses {:.3} fast fails {:.4}", tot.get(), evl::MISSES.load(Ordering::Relaxed) as f64 / tot.get() as f64, evl::FASTMISS.load(Ordering::Relaxed) as f64 / tot.get() as f64);
+    }
+    run("i0", &|| { let mut tf = ts::Fast::default(); evl::mb_fused4::<0>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    run("i1", &|| { let mut tf = ts::Fast::default(); evl::mb_fused4::<1>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    run("i5", &|| { let mut tf = ts::Fast::default(); evl::mb_fused4::<5>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    run("k0", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<0>(&buf, start, end, ctx, &mut tf, ib) });
+    run("k10", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<10>(&buf, start, end, ctx, &mut tf, ib) });
+    run("k11", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<11>(&buf, start, end, ctx, &mut tf, ib) });
+    run("k12", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<12>(&buf, start, end, ctx, &mut tf, ib) });
+    run("k13", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<13>(&buf, start, end, ctx, &mut tf, ib) });
+    run("k14", &|| { let mut tf = ts::Fast::default(); evl::mb_fused6::<14>(&buf, start, end, ctx, &mut tf, ib) });
+    run("m7", &|| { let mut tf = ts::Fast::default(); evl::mb_fused7(&buf, start, end, ctx, &mut tf, ib) });
+    run("n8", &|| { let mut tf = ts::Fast::default(); evl::mb_fused8(&buf, start, end, ctx, &mut tf, ib) });
+    run("o9", &|| { let mut tf = ts::Fast::default(); evl::mb_fused9(&buf, start, end, ctx, &mut tf, ib) });
+    run("h7", &|| { let mut tf = ts::Fast::default(); evl::mb_fused3::<7>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    run("j0", &|| { let mut tf = ts::Fast::default(); evl::mb_fused5::<0>(&buf, start, end, ctx, &mut tf, ib) });
+    if only.contains("cmp5") {
+        let flat = |v: &Ev| [v.eid, v.ehi, v.elo, v.user, v.uhi, v.ulo, v.ingest as u64, v.ts as u64, v.pc as u64];
+        let mut a: Vec<[u64; 9]> = Vec::new();
+        let mut b: Vec<[u64; 9]> = Vec::new();
+        let mut tf = ts::Fast::default();
+        scan::lines_old::<7>(&buf, start, end, |f| if let Some(v) = parse_event(ctx, &mut tf, f, ib) { a.push(flat(&v)) });
+        let mut tf = ts::Fast::default();
+        scan::lines_old::<7>(&buf, start, end, |f| if let Some(v) = evl::parse_event_b(ctx, &mut tf, f, ib) { b.push(flat(&v)) });
+        let bad = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        eprintln!("cmp5: {} vs {} events, {} differ", a.len(), b.len(), bad);
+        for (x, y) in a.iter().zip(b.iter()).filter(|(x, y)| x != y).take(5) {
+            eprintln!("  old {:x?}\n  new {:x?}", x, y);
+        }
+    }
+    run("h1", &|| { let mut tf = ts::Fast::default(); evl::mb_fused3::<1>(&buf, start, end, ctx, &mut tf, &mut shp.borrow_mut(), ib) });
+    run("fused1", &|| { let mut tf = ts::Fast::default(); evl::mb_fused::<1>(&buf, start, end, ctx, &mut tf, ib) });
+    run("fused2", &|| { let mut tf = ts::Fast::default(); evl::mb_fused::<2>(&buf, start, end, ctx, &mut tf, ib) });
+    run("fused3", &|| { let mut tf = ts::Fast::default(); evl::mb_fused::<3>(&buf, start, end, ctx, &mut tf, ib) });
+    run("event-old", &|| { let mut tf = ts::Fast::default(); mb_event(&buf, start, end, ctx, &mut tf, ib) });
+    run("event", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c = c.wrapping_add(parse_event(ctx, &mut tf, f, ib).map_or(0, |v| v.eid ^ v.user))); c });
     run("event+push", &|| {
         let arena = Arena::new(1 << 30);
         let mut parts: Vec<Blocks<Ev>> = (0..2048).map(|_| Blocks::new()).collect();
         let mut tf = ts::Fast::default();
-        scan::lines::<7>(&buf, start, end, |f| if let Some(ev) = parse_event(ctx, &mut tf, f, ib) { parts[(hash(ev.eid) >> 53) as usize].push(&arena, ev) });
+        scan::lines::<7>(&buf, start, end, #[inline(always)] |f| if let Some(ev) = parse_event(ctx, &mut tf, f, ib) { parts[(hash(ev.eid) >> 53) as usize].push(&arena, ev) });
         parts.iter().map(|p| p.len() as u64).sum()
     });
     // ablations: each drops one piece of parse_event
-    run("ev-no-ts", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+    run("ev-no-ts", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
         let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ ing as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[2].len() as u64); }); c });
-    run("ev-no-ing", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+    run("ev-no-ing", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
         let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[3].len() as u64); }); c });
-    run("ev-no-keys", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+    run("ev-no-keys", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
         let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
         let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(f[0].len() as u64 ^ f[1].len() as u64 ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
-    run("ev-no-prod", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+    run("ev-no-prod", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
         let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) };
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ f[5].len() as u64 ^ f[4].len() as u64); }); c });
-    run("ev-all4", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
+    run("ev-all4", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
         let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
-    run("validate", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, &mut tf, f, 0).map_or(0, |v| v.0 as u64)); c });
+    run("validate", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, #[inline(always)] |f| c += validate(ctx, &mut tf, f, 0).map_or(0, |v| v.0 as u64)); c });
 }
 
 #[cfg(test)]
@@ -2078,4 +2174,11 @@ mod tests {
             assert_eq!(unsafe { m.get_padded(&buf[..k.len()]) }, m.get(k), "{:?}", k);
         }
     }
+}
+
+#[inline(never)]
+fn mb_event(buf: &[u8], start: usize, end: usize, ctx: &Ctx, tf: &mut ts::Fast, ib: i64) -> u64 {
+    let mut c = 0u64;
+    scan::lines_old::<7>(buf, start, end, #[inline(always)] |f| c = c.wrapping_add(parse_event(ctx, tf, f, ib).map_or(0, |v| v.eid ^ v.user ^ v.ts as u64 ^ v.pc as u64 ^ v.ingest as u64 ^ v.uhi ^ v.ehi)));
+    c
 }

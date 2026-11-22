@@ -208,6 +208,44 @@ pub fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
     }
 }
 
+/// The 32 hex digits at p (32 bytes readable) -> (hi, lo, all lowercase hex). Same value as
+/// `parse_long` on a 33-byte ID whose prefix byte precedes p.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+pub unsafe fn hex32(p: *const u8) -> (u64, u64, bool) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_loadu_si256(p as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_l = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        let ok = _mm256_movemask_epi8(_mm256_or_si256(is_d, is_l)) == -1;
+        let nib = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(10)), d, is_d);
+        let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(w, w);
+        let a = _mm256_extract_epi64::<0>(packed) as u64;
+        let b = _mm256_extract_epi64::<2>(packed) as u64;
+        (u64::from_be(a.to_le()), u64::from_be(b.to_le()), ok)
+    }
+}
+
+/// Prefetches the long-table slot of (pre, hi, lo) when `on`, else touches `dummy` (no branch).
+#[inline(always)]
+pub fn prefetch_long_if(on: bool, pre: u8, hi: u64, lo: u64, dummy: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(t) = LONG_TABLE.get() {
+        let i = long_slot0(pre, hi, lo) & t.mask;
+        let a = unsafe { t.slots.as_ptr().add(i) } as *const u8;
+        let a = if on { a } else { dummy };
+        unsafe {
+            use std::arch::x86_64::*;
+            _mm_prefetch(a as *const i8, _MM_HINT_T0);
+            _mm_prefetch(a.add(std::mem::size_of::<Slot>() - 1) as *const i8, _MM_HINT_T0);
+        }
+    }
+}
+
 #[cfg(not(target_feature = "avx2"))]
 pub fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
     if s.len() != 33 || !s[0].is_ascii_lowercase() {
@@ -427,6 +465,41 @@ unsafe fn pack16(s: &[u8]) -> Option<u64> {
 #[inline(always)]
 unsafe fn pack16(s: &[u8]) -> Option<u64> {
     pack(s)
+}
+
+/// `pack` of two IDs at once (16 bytes readable at a and b); only meaningful for lengths 1..=10.
+/// (key a, key b, a canonical, b canonical); a key is meaningless unless its flag is set.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+pub unsafe fn pack2(a: *const u8, b: *const u8, na: u8, nb: u8) -> (u64, u64, bool, bool) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let v = _mm256_inserti128_si256::<1>(_mm256_castsi128_si256(_mm_loadu_si128(a as *const __m128i)), _mm_loadu_si128(b as *const __m128i));
+        let n = _mm256_shuffle_epi8(
+            _mm256_set1_epi16(na as i16 | (nb as i16) << 8),
+            _mm256_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1),
+        );
+        let idx = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        let live = _mm256_cmpgt_epi8(n, idx);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_l = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(25)), l);
+        let bad = _mm256_andnot_si256(_mm256_or_si256(is_d, is_l), live);
+        let code = _mm256_blendv_epi8(_mm256_add_epi8(l, _mm256_set1_epi8(11)), _mm256_add_epi8(d, _mm256_set1_epi8(1)), is_d);
+        let code = _mm256_and_si256(code, live);
+        let p = _mm256_maddubs_epi16(code, _mm256_set1_epi16(0x0140));
+        let q = _mm256_madd_epi16(p, _mm256_set1_epi32(0x0001_1000));
+        // per lane: dwords d0..d2 hold codes 0-3, 4-7, 8-9 (24 bits each); key = d0 << 36 | d1 << 12 | d2 >> 12
+        let a0 = _mm256_extract_epi64::<0>(q) as u64;
+        let a1 = _mm256_extract_epi64::<1>(q) as u64;
+        let b0 = _mm256_extract_epi64::<2>(q) as u64;
+        let b1 = _mm256_extract_epi64::<3>(q) as u64;
+        let ka = (a0 << 36) | ((a0 >> 32) << 12) | ((a1 & 0xFFFF_FFFF) >> 12);
+        let kb = (b0 << 36) | ((b0 >> 32) << 12) | ((b1 & 0xFFFF_FFFF) >> 12);
+        let m = _mm256_movemask_epi8(bad) as u32;
+        (ka, kb, m & 0xFFFF == 0, m >> 16 == 0)
+    }
 }
 
 #[inline(always)]

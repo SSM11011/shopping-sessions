@@ -173,7 +173,7 @@ fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: 
         return validate_extract64(buf, s, len, c0 & lm, q0 & lm, fields);
     }
     let lm: u128 = (1u128 << len) - 1;
-    if len <= 96 {
+    if N < 7 && len <= 96 {
         let (c, q) = unsafe { masks96(p.add(s)) };
         return validate_extract(buf, s, len, c & lm, q & lm, fields);
     }
@@ -267,11 +267,224 @@ fn one_line<'a, const N: usize>(
     }
 }
 
+/// Blocks per batch of `lines`.
+const NB: usize = 32;
+
+/// Calls `f` with the N fields of every well-formed line starting in buf[start..end).
+/// Requires buf.len() >= end + PAD and buf[end..end+PAD] zeroed.
+///
+/// Every 64-byte block is classified once: per batch of NB blocks, the comma and quote masks go to
+/// small arrays and the newline positions to `ends`; then each line's masks are funnel-shifted out of
+/// the arrays (two blocks of look-behind carried across batches cover lines that began earlier).
+#[inline(always)]
+pub fn lines<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, f: impl FnMut(&[&'a [u8]; N])) {
+    lines_x::<N, 0>(buf, start, end, f)
+}
+#[inline(always)]
+pub fn lines_x<'a, const N: usize, const MODE: u32>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    debug_assert!(buf.len() >= end + PAD);
+    let p = buf.as_ptr();
+    let mut fields: [&'a [u8]; N] = [&buf[0..0]; N];
+    // index j: block at blk - 128 + 64 j (two blocks of look-behind, NB blocks, slack for funnel reads)
+    let mut cm = [0u64; NB + 4];
+    let mut qm = [0u64; NB + 4];
+    let mut ends = [0u32; NB * 64 + 8];
+    let mut line_start = start;
+    let mut blk = start;
+    while blk < end {
+        let nblk = ((end - blk + 63) >> 6).min(NB);
+        let mut cnt = 0usize;
+        for j in 0..nblk {
+            let at = blk + 64 * j;
+            let (mut m, c, q) = unsafe { masks64(p.add(at)) };
+            if end - at < 64 {
+                m &= (1u64 << (end - at)) - 1;
+            }
+            cm[j + 2] = c;
+            qm[j + 2] = q;
+            // branch-free for up to 4 newlines per block (tz of 0 is 64: written but not counted)
+            let k = m.count_ones() as usize;
+            let base = at as u32;
+            ends[cnt] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 1] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 2] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 3] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            if k > 4 {
+                let mut i = cnt + 4;
+                while m != 0 {
+                    ends[i] = base + m.trailing_zeros();
+                    m &= m - 1;
+                    i += 1;
+                }
+            }
+            cnt += k;
+        }
+        let origin = blk - 128;
+        if MODE == 3 {
+            fields[0] = unsafe { buf.get_unchecked(0..cnt + ends[cnt / 2] as usize % 3 + (cm[5] as usize & 1)) };
+            f(&fields);
+            blk += 64 * nblk;
+            continue;
+        }
+        for &e in &ends[..cnt] {
+            let e = e as usize;
+            let s = line_start;
+            line_start = e + 1;
+            let len = e - s;
+            if len >= 127 {
+                if split(&buf[s..e], &mut fields) {
+                    f(&fields);
+                }
+                continue;
+            }
+            let rel = s - origin;
+            let (k, o) = (rel >> 6, (rel & 63) as u32);
+            let fun = |a: &[u64; NB + 4]| -> u128 {
+                let (w0, w1, w2) = unsafe { (*a.get_unchecked(k), *a.get_unchecked(k + 1), *a.get_unchecked(k + 2)) };
+                let lo = (w0 >> o) | ((w1 << 1) << (63 - o));
+                let hi = (w1 >> o) | ((w2 << 1) << (63 - o));
+                lo as u128 | ((hi as u128) << 64)
+            };
+            if MODE == 1 {
+                let c = fun(&cm) & ((1u128 << len) - 1);
+                if c.count_ones() == N as u32 - 1 { fields[0] = unsafe { buf.get_unchecked(s..s + (c as u64).trailing_zeros() as usize) }; f(&fields); }
+                continue;
+            }
+            if MODE == 2 {
+                let lm: u128 = (1u128 << len) - 1;
+                let c = fun(&cm) & lm; let q = fun(&qm) & lm;
+                let starts = (c << 1) | 1;
+                let lasts = (c | (1u128 << len)) >> 1;
+                let a_mask = q & starts;
+                let b = q & lasts;
+                if c.count_ones() == N as u32 - 1 && (q ^ (a_mask | b)) | (a_mask & b) | (b.wrapping_sub(a_mask) & (c | lasts)) == 0 { fields[0] = unsafe { buf.get_unchecked(s..s + (c as u64).trailing_zeros() as usize) }; f(&fields); }
+                continue;
+            }
+            if MODE == 4 {
+                let lm: u128 = (1u128 << len) - 1;
+                let c = fun(&cm) & lm; let q = fun(&qm) & lm;
+                let starts = (c << 1) | 1;
+                let lasts = (c | (1u128 << len)) >> 1;
+                let a_mask = q & starts;
+                let b = q & lasts;
+                if c.count_ones() == N as u32 - 1 && (q ^ (a_mask | b)) | (a_mask & b) | (b.wrapping_sub(a_mask) & (c | lasts)) == 0 {
+                    // content starts / content ends (exclusive): quotes moved inward
+                    let cs = (starts & !a_mask) | (a_mask << 1);
+                    let ce = ((c | (1u128 << len)) & !(b << 1)) | b;
+                    let mut ps = [0u32; 16];
+                    let mut pe = [0u32; 16];
+                    let (mut sl, mut sh) = (cs as u64, (cs >> 64) as u64);
+                    let (mut el, mut eh) = (ce as u64, (ce >> 64) as u64);
+                    let ks = sl.count_ones() as usize;
+                    let ke = el.count_ones() as usize;
+                    for j in 0..N {
+                        ps[j] = sl.trailing_zeros();
+                        sl &= sl.wrapping_sub(1);
+                        pe[j] = el.trailing_zeros();
+                        el &= el.wrapping_sub(1);
+                    }
+                    for j in 0..N {
+                        unsafe { *ps.get_unchecked_mut(ks + j) = 64 + sh.trailing_zeros() };
+                        sh &= sh.wrapping_sub(1);
+                        unsafe { *pe.get_unchecked_mut(ke + j) = 64 + eh.trailing_zeros() };
+                        eh &= eh.wrapping_sub(1);
+                    }
+                    for j in 0..N {
+                        fields[j] = unsafe { buf.get_unchecked(s + ps[j] as usize..s + pe[j] as usize) };
+                    }
+                    f(&fields);
+                }
+                continue;
+            }
+            let ok = if N < 7 && len < 64 {
+                let lm = (1u64 << len) - 1;
+                validate_extract64(buf, s, len, fun(&cm) as u64 & lm, fun(&qm) as u64 & lm, &mut fields)
+            } else {
+                let lm: u128 = (1u128 << len) - 1;
+                validate_extract(buf, s, len, fun(&cm) & lm, fun(&qm) & lm, &mut fields)
+            };
+            if ok {
+                f(&fields);
+            }
+        }
+        cm[0] = cm[nblk];
+        cm[1] = cm[nblk + 1];
+        qm[0] = qm[nblk];
+        qm[1] = qm[nblk + 1];
+        blk += 64 * nblk;
+    }
+    if line_start < end {
+        // unterminated last line of the file
+        one_line(buf, line_start, end, &mut fields, &mut f);
+    }
+}
+
 /// Calls `f` with the N fields of every well-formed line starting in buf[start..end).
 /// Requires buf.len() >= end + PAD and buf[end..end+PAD] zeroed. Newlines are indexed in batches first
 /// so that the per-line work has no serial dependency and pipelines.
 #[inline(always)]
-pub fn lines<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn lines_old<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
+    let mut fields: [&'a [u8]; N] = [&buf[0..0]; N];
+    let mut line_start = start;
+    line_ends(buf, start, end, |e| {
+        one_line(buf, line_start, e, &mut fields, &mut f);
+        line_start = e + 1;
+    });
+    if line_start < end {
+        // unterminated last line of the file
+        one_line(buf, line_start, end, &mut fields, &mut f);
+    }
+}
+
+/// Calls `f` with the offset of every '\n' in buf[start..end), in order. Newlines are indexed in
+/// batches first so that the per-line work has no serial dependency and pipelines.
+#[inline(always)]
+pub fn line_ends(buf: &[u8], start: usize, end: usize, mut f: impl FnMut(usize)) {
+    debug_assert!(buf.len() >= end + PAD);
+    let p = buf.as_ptr();
+    let mut ends = [0u32; 640]; // 512 + one block of 64 + slack
+    let mut scan = start;
+    while scan < end {
+        let mut cnt = 0usize;
+        while cnt < 512 && scan < end {
+            let mut m = unsafe { nl64(p.add(scan)) };
+            if end - scan < 64 {
+                m &= (1u64 << (end - scan)) - 1;
+            }
+            // branch-free for up to 4 newlines per block (tz of 0 is 64: written but not counted)
+            let k = m.count_ones() as usize;
+            let base = scan as u32;
+            ends[cnt] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 1] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 2] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            ends[cnt + 3] = base + m.trailing_zeros();
+            m &= m.wrapping_sub(1);
+            if k > 4 {
+                let mut j = cnt + 4;
+                while m != 0 {
+                    ends[j] = base + m.trailing_zeros();
+                    m &= m - 1;
+                    j += 1;
+                }
+            }
+            cnt += k;
+            scan += 64;
+        }
+        for &e in &ends[..cnt] {
+            f(e as usize);
+        }
+    }
+}
+
+#[allow(dead_code)]
+fn lines_old0<'a, const N: usize>(buf: &'a [u8], start: usize, end: usize, mut f: impl FnMut(&[&'a [u8]; N])) {
     debug_assert!(buf.len() >= end + PAD);
     let p = buf.as_ptr();
     let mut fields: [&'a [u8]; N] = [&buf[0..0]; N];
@@ -439,4 +652,17 @@ pub fn bench_validate<const N: usize>(buf: &[u8], start: usize, end: usize) -> u
         s = e + 1;
     }
     acc
+}
+
+#[inline(never)]
+pub fn mb_lall_old(buf: &[u8], start: usize, end: usize) -> u64 {
+    let mut c = 0u64;
+    lines_old::<7>(buf, start, end, |f| c += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>());
+    c
+}
+#[inline(never)]
+pub fn mb_lall(buf: &[u8], start: usize, end: usize) -> u64 {
+    let mut c = 0u64;
+    lines::<7>(buf, start, end, |f| c += f.iter().map(|x| x.len() as u64 ^ x.as_ptr() as u64).sum::<u64>());
+    c
 }
