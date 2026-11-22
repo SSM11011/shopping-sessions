@@ -9,39 +9,38 @@ pub const PAD: usize = 256;
 /// Loads the lines that *start* in file range [s, e) into `buf`.
 /// Returns (first line start, end of data) as buffer offsets; buf[data_end..data_end+PAD] is zeroed.
 pub fn load(file: &File, flen: usize, s: usize, e: usize, buf: &mut Vec<u8>) -> (usize, usize) {
-    let from = s.saturating_sub(1);
+    // The kernel copies page cache -> buf page by page with `rep movsb`, which is markedly slower when
+    // source and destination are misaligned to each other. So read from a 64-byte aligned file offset
+    // into a 64-byte aligned buffer position `b0`.
+    let from = s.saturating_sub(1) & !63;
     let mut want = (e + 4096).min(flen) - from;
+    let mut b0;
     loop {
-        if buf.len() < want + PAD {
-            buf.resize(want + PAD, 0);
+        if buf.len() < want + PAD + 64 {
+            buf.resize(want + PAD + 64, 0);
         }
-        file.read_exact_at(&mut buf[..want], from as u64).expect("read");
+        b0 = buf.as_ptr().align_offset(64);
+        file.read_exact_at(&mut buf[b0..b0 + want], from as u64).expect("read");
         // the last line starting before e must end inside the buffer (or at EOF)
-        let stop = e - from; // lines must start before this offset
-        let tail_ok = from + want == flen || memchr::memchr(b'\n', &buf[stop - 1..want]).is_some();
+        let stop = b0 + e - from; // lines must start before this offset
+        let tail_ok = from + want == flen || memchr::memchr(b'\n', &buf[stop - 1..b0 + want]).is_some();
         if tail_ok {
             break;
         }
         want = (want * 2).min(flen - from);
     }
-    let stop = e - from;
-    let data_end = match memchr::memchr(b'\n', &buf[stop - 1..want]) {
+    let stop = b0 + e - from;
+    let data_end = match memchr::memchr(b'\n', &buf[stop - 1..b0 + want]) {
         Some(p) => stop - 1 + p + 1,
-        None => want,
+        None => b0 + want,
     };
     buf[data_end..data_end + PAD].fill(0);
-    let start = if s == 0 {
-        // skip the header line
-        match memchr::memchr(b'\n', &buf[..data_end]) {
-            Some(p) => p + 1,
-            None => data_end,
-        }
-    } else {
-        // buf[0] is byte s-1: the first line starting at or after s follows the first '\n' at or after s-1
-        match memchr::memchr(b'\n', &buf[..data_end]) {
-            Some(p) => p + 1,
-            None => data_end,
-        }
+    // s == 0: skip the header line. Else buf[b0 + s-1-from] is byte s-1: the first line starting at or
+    // after s follows the first '\n' at or after s-1.
+    let look = if s == 0 { b0 } else { b0 + s - 1 - from };
+    let start = match memchr::memchr(b'\n', &buf[look..data_end]) {
+        Some(p) => look + p + 1,
+        None => data_end,
     };
     (start, data_end)
 }
