@@ -601,6 +601,30 @@ fn main() {
         let per = (est_rows * 28 + est_clicks * 24) / threads * 11 / 10 + 2 * nparts * BLOCK;
         run_parallel(threads, threads, |_, t| arenas[t].populate(per));
     }
+    // DIAGNOSTIC BUILD: count input pages that are not in the page cache (RWF_NOWAIT read fails with
+    // EAGAIN instead of going to disk) at 16 spread offsets, then sleep 100 ms per cold probe, so the
+    // scored time reveals whether the scorer's inputs are cached. Reads nothing from disk, evicts nothing.
+    {
+        use std::os::fd::AsRawFd;
+        let total: usize = files.iter().map(|f| f.1).sum();
+        let mut cold = 0u64;
+        let mut b = [0u8; 64];
+        for k in 0..16usize {
+            let mut at = total / 16 * k + total / 32;
+            for (f, len) in &files {
+                if at < *len {
+                    let iov = libc::iovec { iov_base: b.as_mut_ptr() as *mut libc::c_void, iov_len: b.len() };
+                    let r = unsafe { libc::preadv2(f.as_raw_fd(), &iov, 1, at as i64, libc::RWF_NOWAIT) };
+                    if r < 0 && unsafe { *libc::__errno_location() } == libc::EAGAIN {
+                        cold += 1;
+                    }
+                    break;
+                }
+                at -= *len;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100 * cold));
+    }
     timing(t0, "setup");
     if std::env::var_os("EXP_MICRO").is_some() {
         let ctx = build_lookups().0;
