@@ -67,10 +67,14 @@ pub fn write_all(
     std::fs::create_dir_all(&cd).expect("mkdir");
     let _ = (results, cat_names, ud);
     {
+        // campaign_id: dictionary of the campaigns with rows (their rows are contiguous: RLE runs);
+        // channel and day: small dictionaries; counts: DELTA_BINARY_PACKED
         let (mut ib, mut ie, mut cb, mut ce) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        let mut days = Vec::new();
+        let mut chans: Vec<&[u8]> = Vec::new();
+        let (mut cidx, mut hidx, mut didx) = (Vec::new(), Vec::new(), Vec::new());
         let mut v: [Vec<i64>; 4] = Default::default();
         for c in 0..=camp_ids.len() {
+            let mut named = false;
             for d in 0..ndays {
                 let cell = camp[c * ndays + d];
                 if cell[0] == 0 && cell[3] == 0 {
@@ -78,27 +82,48 @@ pub fn write_all(
                 }
                 let (id, ch): (&[u8], &[u8]) =
                     if c == camp_ids.len() { (b"organic", b"organic") } else { (&camp_ids[c], &channels[c]) };
-                ib.extend_from_slice(id);
-                ie.push(ib.len() as u32);
-                cb.extend_from_slice(ch);
-                ce.push(cb.len() as u32);
-                days.push((ws_day + d as i64) as i32);
+                if !named {
+                    named = true;
+                    ib.extend_from_slice(id);
+                    ie.push(ib.len() as u32);
+                }
+                cidx.push(ie.len() as u32 - 1);
+                let h = match chans.iter().position(|&x| x == ch) {
+                    Some(h) => h,
+                    None => {
+                        chans.push(ch);
+                        cb.extend_from_slice(ch);
+                        ce.push(cb.len() as u32);
+                        chans.len() - 1
+                    }
+                };
+                hidx.push(h as u32);
+                didx.push(d as u32);
                 for k in 0..4 {
                     v[k].push(cell[k]);
                 }
             }
         }
+        let days: Vec<i32> = (0..ndays.max(1)).map(|d| (ws_day + d as i64) as i32).collect();
         pq::write(
             &cd.join("part-00000.parquet"),
-            days.len(),
+            didx.len(),
             &[
-                Column { name: "campaign_id", date: false, data: Data::Str { bytes: &ib, ends: &ie, present: None } },
-                Column { name: "channel", date: false, data: Data::Str { bytes: &cb, ends: &ce, present: None } },
-                Column { name: "day", date: true, data: Data::I32(&days) },
-                Column { name: "sessions", date: false, data: Data::I64(&v[0]) },
-                Column { name: "purchasing_sessions", date: false, data: Data::I64(&v[1]) },
-                Column { name: "revenue_cents", date: false, data: Data::I64(&v[2]) },
-                Column { name: "assisted_sessions", date: false, data: Data::I64(&v[3]) },
+                Column {
+                    name: "campaign_id",
+                    date: false,
+                    data: Data::Dict { dict: Dict::Str { bytes: &ib, ends: &ie }, idx: &cidx, present: None, runs: true },
+                },
+                Column {
+                    name: "channel",
+                    date: false,
+                    data: Data::Dict { dict: Dict::Str { bytes: &cb, ends: &ce }, idx: &hidx, present: None, runs: false },
+                },
+                Column { name: "day", date: true, data: Data::Dict { dict: Dict::I32(&days), idx: &didx, present: None, runs: false } },
+                Column { name: "sessions", date: false, data: Data::DeltaI64(&v[0]) },
+                Column { name: "purchasing_sessions", date: false, data: Data::DeltaI64(&v[1]) },
+                Column { name: "revenue_cents", date: false, data: Data::DeltaI64(&v[2]) },
+                Column { name: "assisted_sessions", date: false, data: Data::DeltaI64(&v[3]) },
             ],
         )
         .expect("write campaign_daily");
