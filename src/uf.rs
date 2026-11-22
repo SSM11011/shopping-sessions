@@ -134,6 +134,9 @@ pub struct LinkMap {
     bmask: usize,
 }
 
+/// Probe target for Bloom misses: an empty slot.
+static MISS: (u64, u64) = (EMPTY, 0);
+
 #[inline(always)]
 fn bloom_bits(h: u64) -> u64 {
     (1u64 << (h & 63)) | (1u64 << ((h >> 6) & 63))
@@ -215,19 +218,25 @@ impl LinkMap {
             use std::arch::x86_64::*;
             let w = *self.bloom.get_unchecked((h >> 40) as usize & self.bmask);
             let b = bloom_bits(h);
-            if w & b == b {
-                _mm_prefetch(self.slots.as_ptr().add(h as usize & self.mask) as *const i8, _MM_HINT_T0);
-            }
+            // branch-free (the hit rate is near 50/50): on a miss prefetch the always-cached dummy slot
+            let p = std::hint::select_unpredictable(w & b == b, self.slots.as_ptr().add(h as usize & self.mask), &raw const MISS);
+            _mm_prefetch(p as *const i8, _MM_HINT_T0);
         }
     }
 
     #[inline(always)]
     pub fn person_h(&self, k: u64, h: u64) -> u64 {
         let b = bloom_bits(h);
-        if unsafe { *self.bloom.get_unchecked((h >> 40) as usize & self.bmask) } & b != b {
-            return k;
-        }
+        let hit = unsafe { *self.bloom.get_unchecked((h >> 40) as usize & self.bmask) } & b == b;
+        // branch-free first probe: a Bloom miss reads the dummy empty slot instead
         let mut i = h as usize & self.mask;
+        let p = std::hint::select_unpredictable(hit, unsafe { self.slots.as_ptr().add(i) }, &raw const MISS);
+        let (s, v) = unsafe { *p };
+        if s == EMPTY || s == k {
+            return std::hint::select_unpredictable(s == k, v, k);
+        }
+        // occupied by another key: linear probing continues (rare)
+        i = (i + 1) & self.mask;
         loop {
             let (s, v) = unsafe { *self.slots.get_unchecked(i) };
             if s == k {
