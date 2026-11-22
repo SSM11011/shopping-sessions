@@ -618,12 +618,27 @@ fn main() {
         let o = &mut *guard;
         let mut buf = std::mem::take(&mut o.buf);
         let (start, end) = scan::load(file, *flen, task.s, task.e, &mut buf);
+        // long IDs: table slot prefetched at parse, key resolved LR lines later
+        const LR: usize = 8;
+        let mut ring = [[(0u64, 0u64, 0u64); 2]; LR];
+        let mut n = 0usize;
+        let res = |x: (u64, u64, u64)| keys::resolve(x.0, x.1, x.2);
         scan::lines::<2>(&buf, start, end, |f| {
             if f[0].is_empty() || f[1].is_empty() {
                 return;
             }
-            o.links.push(unsafe { (keys::key_padded(f[0]), keys::key_padded(f[1])) });
+            let ab = unsafe { [keys::key_deferred(f[0]), keys::key_deferred(f[1])] };
+            let s = n & (LR - 1);
+            if n >= LR {
+                o.links.push((res(ring[s][0]), res(ring[s][1])));
+            }
+            ring[s] = ab;
+            n += 1;
         });
+        for k in n.saturating_sub(LR)..n {
+            let s = k & (LR - 1);
+            o.links.push((res(ring[s][0]), res(ring[s][1])));
+        }
         o.buf = buf;
     });
     timing(t0, "lparse");
