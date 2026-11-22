@@ -129,6 +129,30 @@ unsafe fn nl64(p: *const u8) -> u64 {
     }
 }
 
+#[inline(always)]
+unsafe fn masks96(p: *const u8) -> (u128, u128) {
+    #[cfg(target_feature = "avx2")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let a = _mm256_loadu_si256(p as *const __m256i);
+        let b = _mm256_loadu_si256(p.add(32) as *const __m256i);
+        let c = _mm256_loadu_si256(p.add(64) as *const __m256i);
+        let m = |v: __m256i, ch: u8| -> u64 {
+            (_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(ch as i8))) as u32) as u64
+        };
+        (
+            (m(a, b',') | (m(b, b',') << 32)) as u128 | ((m(c, b',') as u128) << 64),
+            (m(a, b'"') | (m(b, b'"') << 32)) as u128 | ((m(c, b'"') as u128) << 64),
+        )
+    }
+    #[cfg(not(target_feature = "avx2"))]
+    unsafe {
+        let (_, c0, q0) = masks64(p);
+        let (_, c1, q1) = masks64(p.add(64));
+        (c0 as u128 | ((c1 as u128) << 64), q0 as u128 | ((q1 as u128) << 64))
+    }
+}
+
 #[cfg(not(target_feature = "avx2"))]
 #[inline(always)]
 unsafe fn nl64(p: *const u8) -> u64 {
@@ -143,9 +167,13 @@ unsafe fn nl64(p: *const u8) -> u64 {
 #[inline(always)]
 fn split_short<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, fields: &mut [&'a [u8]; N]) -> bool {
     let p = buf.as_ptr();
+    let lm: u128 = (1u128 << len) - 1;
+    if len <= 96 {
+        let (c, q) = unsafe { masks96(p.add(s)) };
+        return validate_extract(buf, s, len, c & lm, q & lm, fields);
+    }
     let (_, c0, q0) = unsafe { masks64(p.add(s)) };
     let (_, c1, q1) = unsafe { masks64(p.add(s + 64)) };
-    let lm: u128 = (1u128 << len) - 1;
     let c = (c0 as u128 | ((c1 as u128) << 64)) & lm;
     let q = (q0 as u128 | ((q1 as u128) << 64)) & lm;
     validate_extract(buf, s, len, c, q, fields)
@@ -165,18 +193,22 @@ fn validate_extract<'a, const N: usize>(buf: &'a [u8], s: usize, len: usize, c: 
         return false;
     }
     let mut fs = 0usize;
-    // comma positions from two 64-bit halves (no 128-bit shifts/borrows in the loop)
+    // comma positions, branch-free: every low-half position, then every high-half one after them
+    // (tz of 0 is 64: such slots are written but overwritten or unused)
     let mut lo = c as u64;
     let mut hi = (c >> 64) as u64;
+    let k = lo.count_ones() as usize;
+    let mut pos = [0u32; 16];
+    for j in 0..N - 1 {
+        pos[j] = lo.trailing_zeros();
+        lo &= lo.wrapping_sub(1);
+    }
+    for j in 0..N - 1 {
+        unsafe { *pos.get_unchecked_mut(k + j) = 64 + hi.trailing_zeros() };
+        hi &= hi.wrapping_sub(1);
+    }
     for (i, slot) in fields.iter_mut().enumerate() {
-        let fe = if i + 1 < N {
-            let in_lo = lo != 0;
-            let t = if in_lo { lo.trailing_zeros() } else { 64 + hi.trailing_zeros() } as usize;
-            if in_lo { lo &= lo - 1 } else { hi &= hi.wrapping_sub(1) }
-            t
-        } else {
-            len
-        };
+        let fe = if i + 1 < N { pos[i] as usize } else { len };
         // a validated line has quotes only in pairs at field edges, so the first byte decides
         let qd = (unsafe { *buf.get_unchecked(s + fs) } == b'"') as usize;
         *slot = unsafe { buf.get_unchecked(s + fs + qd..s + fe - qd) };
