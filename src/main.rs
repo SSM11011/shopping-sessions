@@ -1218,6 +1218,7 @@ fn person_sessions(
     n_camp: usize,
 ) {
     let week = WEEK as u32;
+    let ws_off = ws.rem_euclid(DAY) as u64;
     let (mut lo, mut hi) = (0usize, 0usize);
     let (mut first_day, mut last_day) = (usize::MAX, usize::MAX);
     // current (person, day) accumulator
@@ -1266,8 +1267,9 @@ fn person_sessions(
             j += 1;
         }
         let n = (j - i) as i64;
-        let day = (ws + start as i64).div_euclid(DAY);
-        let di = (day - ws_day) as usize;
+        // day index from the u32 offset: (ms since ws + ws's offset into its day) / day length
+        let di = ((start as u64 + ws_off) / DAY as u64) as usize;
+        let day = ws_day + di as i64;
         debug_assert!(di < ndays);
         // attribution: clicks in click-relative coords; session start s_c = start + week
         let s_c = start + week;
@@ -1304,8 +1306,8 @@ fn person_sessions(
         a_sess += 1;
         a_ev += n;
         a_rev += rev;
-        let next_day = if j < evs.len() { Some((ws + evs[j].ts as i64).div_euclid(DAY)) } else { None };
-        if next_day != Some(day) {
+        let next_di = if j < evs.len() { ((evs[j].ts as u64 + ws_off) / DAY as u64) as usize } else { usize::MAX };
+        if next_di != di {
             flush(wo, day, a_sess, a_ev, a_rev);
             a_sess = 0;
             a_ev = 0;
