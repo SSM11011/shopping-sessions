@@ -8,6 +8,8 @@ pub struct Arena {
     base: *mut u8,
     cap: usize,
     used: AtomicUsize,
+    /// arena offset up to which pages were populated in bulk (see `populate_ahead`)
+    pop_end: AtomicUsize,
     /// end of this arena's huge-page range (0 once switched to normal pages)
     huge_end: AtomicUsize,
     /// recycled BLOCK-sized blocks (only touched by the arena's own worker thread)
@@ -69,6 +71,7 @@ fn thp_counters() -> Option<(u64, u64)> {
 static THP_BASE_ALLOC: AtomicUsize = AtomicUsize::new(0);
 static THP_BASE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
 static THP_PROBES: AtomicUsize = AtomicUsize::new(0);
+static POPN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 /// set once huge pages are judged not worth it on this machine (they mostly fall back)
 static THP_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -101,7 +104,7 @@ impl Arena {
             if huge > 0 {
                 libc::madvise(p, huge, libc::MADV_HUGEPAGE);
             }
-            Some(Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), huge_end: AtomicUsize::new(huge), free: Default::default() })
+            Some(Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), pop_end: AtomicUsize::new(0), huge_end: AtomicUsize::new(huge), free: Default::default() })
         }
     }
 
@@ -165,11 +168,42 @@ impl Arena {
             if at & ((2 << 20) - 1) == 0 && at < self.huge_end.load(Relaxed) {
                 self.probe_huge(p, at);
             }
+            self.populate_ahead(at, at + BLOCK);
             p
         } else {
             // rows are addressed by arena offset (dedup refs), so a heap block would corrupt them
             panic!("arena full ({} bytes)", self.cap);
         }
+    }
+
+    /// Outside the huge-page range, fault the arena in 2 MB steps with one MADV_POPULATE_WRITE each
+    /// instead of 512 separate 4 KB page faults (same zeroing, far fewer kernel entries).
+    #[inline(always)]
+    fn populate_ahead(&self, start: usize, end: usize) {
+        let pe = self.pop_end.load(Relaxed);
+        if end > pe {
+            self.populate_slow(start, end, pe);
+        }
+    }
+
+    #[cold]
+    fn populate_slow(&self, start: usize, end: usize, pe: usize) {
+        let n = *POPN.get_or_init(|| std::env::var("SESSIONS_POPN").ok().and_then(|v| v.parse().ok()).unwrap_or(2 << 20));
+        if n == 0 {
+            self.pop_end.store(usize::MAX, Relaxed);
+            return;
+        }
+        let h = self.huge_end.load(Relaxed);
+        if end <= h {
+            return; // huge pages here: one fault per 2 MB already
+        }
+        let mut pe = pe.max(h).max(start & !4095);
+        while pe < end {
+            let len = n.min(self.cap - pe);
+            unsafe { libc::madvise(self.base.add(pe) as *mut libc::c_void, len, 23 /* MADV_POPULATE_WRITE */) };
+            pe += len;
+        }
+        self.pop_end.store(pe, Relaxed);
     }
 
     fn block(&self) -> *mut u8 {
@@ -184,6 +218,7 @@ impl Arena {
         let at = (self.used.load(Relaxed) + 63) & !63;
         if at + bytes <= self.cap {
             self.used.store(at + bytes, Relaxed);
+            self.populate_ahead(at, at + bytes);
             unsafe { self.base.add(at) }
         } else {
             panic!("arena full ({} bytes)", self.cap);
@@ -196,7 +231,12 @@ impl Arena {
     /// takes the mmap lock shared, so all workers can free their arenas at once; munmap (or the exit
     /// path) needs it exclusive and frees the pages on one core.
     pub fn release(&self) {
-        let used = (self.used.load(Relaxed) + (2 << 20) - 1) & !((2 << 20) - 1);
+        let mut used = self.used.load(Relaxed);
+        let pe = self.pop_end.load(Relaxed);
+        if pe != usize::MAX {
+            used = used.max(pe);
+        }
+        let used = (used + (2 << 20) - 1) & !((2 << 20) - 1);
         unsafe { libc::madvise(self.base as *mut libc::c_void, used.min(self.cap), libc::MADV_DONTNEED) };
     }
 }
