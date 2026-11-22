@@ -2,35 +2,48 @@
 
 use std::path::Path;
 
-use crate::pq::{self, Column, Data};
+use crate::pq::{self, Column, Data, Dict};
 use crate::WorkerOut;
 
-pub fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>]) {
+pub fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>], ws_day: i64) {
     let rows = r.day.len();
-    let mut tb = Vec::new();
-    let mut te = Vec::new();
+    // top_category: dictionary of every category name (they are few), indices of the non-null rows
+    let mut cb = Vec::new();
+    let mut ce = Vec::with_capacity(cat_names.len());
+    for c in cat_names {
+        cb.extend_from_slice(c);
+        ce.push(cb.len() as u32);
+    }
     let mut present = Vec::with_capacity(rows);
+    let mut tidx = Vec::new();
     for &t in &r.top {
-        if t == u32::MAX {
-            present.push(false);
-        } else {
-            present.push(true);
-            tb.extend_from_slice(&cat_names[t as usize]);
-            te.push(tb.len() as u32);
+        present.push(t != u32::MAX);
+        if t != u32::MAX {
+            tidx.push(t);
         }
     }
+    let ndays = r.day.iter().max().map_or(1, |&d| d as usize + 1);
+    let days: Vec<i32> = (0..ndays).map(|d| (ws_day + d as i64) as i32).collect();
     pq::write(
         path,
         rows,
         &[
-            Column { name: "user_id", date: false, data: Data::Str { bytes: &r.names, ends: &r.name_end, present: None } },
-            Column { name: "day", date: true, data: Data::I32(&r.day) },
-            Column { name: "sessions", date: false, data: Data::I32(&r.sessions) },
-            Column { name: "events", date: false, data: Data::I32(&r.events) },
+            Column {
+                name: "user_id",
+                date: false,
+                data: Data::Dict { dict: Dict::Str { bytes: &r.names, ends: &r.name_end }, idx: &r.uidx, present: None, runs: true },
+            },
+            Column { name: "day", date: true, data: Data::Dict { dict: Dict::I32(&days), idx: &r.day, present: None, runs: false } },
+            Column { name: "sessions", date: false, data: Data::DeltaI32(&r.sessions) },
+            Column { name: "events", date: false, data: Data::DeltaI32(&r.events) },
             // always INT64: a per-file choice could give files different schemas, which multi-file
             // readers (polars glob, pyarrow dataset) reject
-            Column { name: "revenue_cents", date: false, data: Data::I64(&r.revenue) },
-            Column { name: "top_category", date: false, data: Data::Str { bytes: &tb, ends: &te, present: Some(&present) } },
+            Column { name: "revenue_cents", date: false, data: Data::DeltaI64(&r.revenue) },
+            Column {
+                name: "top_category",
+                date: false,
+                data: Data::Dict { dict: Dict::Str { bytes: &cb, ends: &ce }, idx: &tidx, present: Some(&present), runs: false },
+            },
         ],
     )
     .expect("write user_daily");

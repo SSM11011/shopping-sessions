@@ -18,6 +18,11 @@ extern "C" fn on_prof(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut 
     }
 }
 
+/// Current sample count (phase markers for SESSIONS_PROF_OUT).
+pub fn mark() -> usize {
+    N.load(Ordering::Relaxed)
+}
+
 pub fn start() {
     if std::env::var_os("SESSIONS_PROF_OUT").is_none() {
         return;

@@ -428,6 +428,9 @@ fn timing(t0: Instant, what: &str) {
             ru.ru_minflt
         };
         eprintln!("{what:>9} {:>7.1} ms  cpu u {u:6.2} s {s:5.2}  minflt {flt}", t0.elapsed().as_secs_f64() * 1e3);
+        if std::env::var_os("SESSIONS_PROF_OUT").is_some() {
+            eprintln!("profmark {what} {}", prof::mark());
+        }
     }
 }
 
@@ -1079,7 +1082,7 @@ fn main() {
         // spread output writing over the stage: flush a file every ~64k rows (keeps the final tail short)
         if wo.day.len() >= FLUSH_ROWS {
             let k = wo.files;
-            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), wo, &cat_names);
+            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), wo, &cat_names, ws_day);
             wo.clear_rows();
             wo.files += 1;
         }
@@ -1089,7 +1092,7 @@ fn main() {
         let wo = wo.get_or_insert_with(new_wo);
         if !wo.day.is_empty() || (w == 0 && wo.files == 0) {
             let k = wo.files;
-            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), &wo, &cat_names);
+            out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), &wo, &cat_names, ws_day);
             wo.files += 1;
         }
     });
@@ -1482,9 +1485,13 @@ const FLUSH_ROWS: usize = 64 << 10;
 const DIRECT_CKS: usize = 32;
 
 pub struct WorkerOut {
+    /// user_id dictionary of the current file: one name per person (rows of a person are contiguous)
     pub names: Vec<u8>,
     pub name_end: Vec<u32>,
-    pub day: Vec<i32>,
+    /// per row: index into names
+    pub uidx: Vec<u32>,
+    /// per row: day index (day - ws_day)
+    pub day: Vec<u32>,
     pub sessions: Vec<i32>,
     pub events: Vec<i32>,
     pub revenue: Vec<i64>,
@@ -1520,6 +1527,7 @@ impl WorkerOut {
         WorkerOut {
             names: Vec::with_capacity(rows * 10),
             name_end: Vec::with_capacity(rows),
+            uidx: Vec::with_capacity(rows),
             day: Vec::with_capacity(rows),
             sessions: Vec::with_capacity(rows),
             events: Vec::with_capacity(rows),
@@ -1549,6 +1557,7 @@ impl WorkerOut {
     fn clear_rows(&mut self) {
         self.names.clear();
         self.name_end.clear();
+        self.uidx.clear();
         self.day.clear();
         self.sessions.clear();
         self.events.clear();
@@ -1604,7 +1613,7 @@ fn person_sessions(
     cks: &[Ck],
     person: u64,
     ws: i64,
-    ws_day: i64,
+    _ws_day: i64,
     ndays: usize,
     n_camp: usize,
 ) {
@@ -1618,12 +1627,15 @@ fn person_sessions(
     // current (person, day) accumulator
     let (mut a_sess, mut a_ev, mut a_rev) = (0i64, 0i64, 0i64);
     wo.cats.clear();
-    let flush = |wo: &mut WorkerOut, day: i64, s: i64, e: i64, r: i64| {
-        let start = wo.names.len();
-        keys::bytes_into(person, &mut wo.names);
-        let _ = start;
-        wo.name_end.push(wo.names.len() as u32);
-        wo.day.push(day as i32);
+    let mut named = false;
+    let flush = |wo: &mut WorkerOut, named: &mut bool, di: usize, s: i64, e: i64, r: i64| {
+        if !*named {
+            *named = true;
+            keys::bytes_into(person, &mut wo.names);
+            wo.name_end.push(wo.names.len() as u32);
+        }
+        wo.uidx.push(wo.name_end.len() as u32 - 1);
+        wo.day.push(di as u32);
         wo.sessions.push(s as i32);
         wo.events.push(e as i32);
         wo.revenue.push(r);
@@ -1663,7 +1675,6 @@ fn person_sessions(
         let n = (j - i) as i64;
         // day index from the u32 offset: (ms since ws + ws's offset into its day) / day length
         let di = ((start as u64 + ws_off) / DAY as u64) as usize;
-        let day = ws_day + di as i64;
         debug_assert!(di < ndays);
         // attribution: clicks in click-relative coords; session start s_c = start + week
         let s_c = start + week;
@@ -1725,7 +1736,7 @@ fn person_sessions(
         a_rev += rev;
         let next_di = if j < evs.len() { ((evs[j].ts as u64 + ws_off) / DAY as u64) as usize } else { usize::MAX };
         if next_di != di {
-            flush(wo, day, a_sess, a_ev, a_rev);
+            flush(wo, &mut named, di, a_sess, a_ev, a_rev);
             a_sess = 0;
             a_ev = 0;
             a_rev = 0;
