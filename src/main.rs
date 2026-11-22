@@ -558,6 +558,9 @@ fn main() {
     run_parallel(threads, threads, |_, t| keys::touch_long(t, threads));
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     arena::decide_thp(threads);
+    if std::env::var_os("SESSIONS_NO_WC").is_some() {
+        arena::WC.store(false, Ordering::Relaxed);
+    }
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
     // a 32-bit ref = worker << 28 | (offset / 16). Twice the estimate is the fallback reservation.
     let full = (4usize << 30) - (2 << 20);
@@ -662,7 +665,7 @@ fn main() {
     // partitions; events go to event_id partitions for dedup.
     const R: usize = 32;
     let main_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind != Kind::Link).collect();
-    run_parallel(threads, main_tasks.len(), |w, t| {
+    run_parallel_fin(threads, main_tasks.len(), |w, t| {
         let task = main_tasks[t];
         let (file, flen) = &files[task.file];
         let arena = &arenas[w];
@@ -776,6 +779,11 @@ fn main() {
             Kind::Link => unreachable!(),
         }
         o.buf = own;
+    }, |w| {
+        // write out the partly filled write-combining lines of this worker's 16-byte row lists
+        let mut o = outs[w].lock().unwrap();
+        o.pe.flush_wc();
+        o.dk.flush_wc();
     });
     let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
     for o in &mut outs {

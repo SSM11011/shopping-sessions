@@ -369,14 +369,24 @@ const PF_DIST: usize = 256;
 pub struct Parts<T: Copy> {
     curs: Vec<*mut T>,
     lists: Vec<Vec<*mut T>>,
+    /// software write-combining (16-byte rows only): one 64-byte staging line per partition; a line goes
+    /// to its block with non-temporal stores once full (no read-for-ownership of the destination)
+    stage: Vec<Line>,
 }
+
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line([u8; 64]);
+
+/// Use software write-combining for 16-byte rows.
+pub static WC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
 
 impl<T: Copy> Default for Parts<T> {
     fn default() -> Self {
-        Parts { curs: Vec::new(), lists: Vec::new() }
+        Parts { curs: Vec::new(), lists: Vec::new(), stage: Vec::new() }
     }
 }
 
@@ -385,11 +395,56 @@ impl<T: Copy> Parts<T> {
 
     pub fn new(n: usize, rows_each: usize) -> Self {
         let cap = rows_each * std::mem::size_of::<T>() / BLOCK + 2;
-        Parts { curs: vec![std::ptr::null_mut(); n], lists: (0..n).map(|_| Vec::with_capacity(cap)).collect() }
+        let wc = std::mem::size_of::<T>() == 16 && WC.load(Relaxed);
+        Parts {
+            curs: vec![std::ptr::null_mut(); n],
+            lists: (0..n).map(|_| Vec::with_capacity(cap)).collect(),
+            stage: if wc { vec![Line([0; 64]); n] } else { Vec::new() },
+        }
+    }
+
+    /// Writes out the partially filled staging lines (call once pushing is over, on the pushing thread).
+    pub fn flush_wc(&mut self) {
+        if self.stage.is_empty() {
+            return;
+        }
+        for (part, &c) in self.curs.iter().enumerate() {
+            let lo = c as usize & 63;
+            if lo != 0 {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(self.stage[part].0.as_ptr(), (c as usize & !63) as *mut u8, lo);
+                }
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            std::arch::x86_64::_mm_sfence();
+        }
     }
 
     #[inline(always)]
     pub fn push_ptr(&mut self, arena: &Arena, part: usize, v: T) -> *mut T {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        if std::mem::size_of::<T>() == 16 && !self.stage.is_empty() {
+            let mut c = unsafe { *self.curs.get_unchecked(part) };
+            if (c as usize) & (BLOCK - 1) == 0 {
+                c = self.grow(arena, part);
+            }
+            unsafe {
+                use std::arch::x86_64::*;
+                let line = self.stage.as_mut_ptr().add(part) as *mut u8;
+                let lo = c as usize & 63;
+                (line.add(lo) as *mut T).write(v);
+                let n = c.add(1);
+                if n as usize & 63 == 0 {
+                    let dst = (n as usize - 64) as *mut __m256i;
+                    _mm256_stream_si256(dst, _mm256_load_si256(line as *const __m256i));
+                    _mm256_stream_si256(dst.add(1), _mm256_load_si256(line.add(32) as *const __m256i));
+                }
+                *self.curs.get_unchecked_mut(part) = n;
+            }
+            return c;
+        }
         let mut c = unsafe { *self.curs.get_unchecked(part) };
         // a block is full when the next row would not fit (offset 0 = full block of a size dividing
         // BLOCK, or no block yet); for sizes dividing BLOCK the second test folds away
