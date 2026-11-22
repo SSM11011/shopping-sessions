@@ -1382,6 +1382,7 @@ fn parse_price(s: &[u8]) -> Option<u32> {
 }
 
 const FLUSH_ROWS: usize = 64 << 10;
+const DIRECT_CKS: usize = 32;
 
 pub struct WorkerOut {
     pub names: Vec<u8>,
@@ -1403,6 +1404,9 @@ pub struct WorkerOut {
     /// sessions counted so far for the current person, per day index
     cum: Vec<u32>,
     cats: Vec<(u32, u64)>,
+    /// per campaign: serial of the last session it assisted (direct mode)
+    stamp: Vec<u32>,
+    serial: u32,
     evs: Vec<Pe>,
     cks: Vec<Ck>,
     eb: Vec<u32>,
@@ -1432,6 +1436,8 @@ impl WorkerOut {
             snap: vec![0; n_camp],
             cum: vec![0; cells / (n_camp + 1)],
             cats: Vec::new(),
+            stamp: vec![0; n_camp],
+            serial: 0,
             evs: Vec::new(),
             cks: Vec::new(),
             eb: Vec::new(),
@@ -1503,6 +1509,9 @@ fn person_sessions(
     ndays: usize,
     n_camp: usize,
 ) {
+    // few clicks: count assists directly per session (bounded by DIRECT_CKS per session); many clicks
+    // (whales): campaigns are activated/deactivated as the window slides and credited per day in bulk
+    let direct = cks.len() <= DIRECT_CKS;
     let week = WEEK as u32;
     let ws_off = ws.rem_euclid(DAY) as u64;
     let (mut lo, mut hi) = (0usize, 0usize);
@@ -1559,13 +1568,34 @@ fn person_sessions(
         debug_assert!(di < ndays);
         // attribution: clicks in click-relative coords; session start s_c = start + week
         let s_c = start + week;
-        while hi < cks.len() && cks[hi].ts <= s_c {
-            wo.add(cks[hi].camp, di);
-            hi += 1;
-        }
-        while lo < hi && cks[lo].ts < start {
-            wo.remove(cks[lo].camp, last_day, ndays);
-            lo += 1;
+        if direct {
+            // few clicks: mark each campaign of the window once per session (stamp = session serial)
+            while hi < cks.len() && cks[hi].ts <= s_c {
+                hi += 1;
+            }
+            while lo < hi && cks[lo].ts < start {
+                lo += 1;
+            }
+            if lo < hi {
+                wo.serial += 1;
+                let sn = wo.serial;
+                for c in &cks[lo..hi] {
+                    let st = unsafe { wo.stamp.get_unchecked_mut(c.camp as usize) };
+                    if *st != sn {
+                        *st = sn;
+                        unsafe { *wo.assist.get_unchecked_mut(c.camp as usize * ndays + di) += 1 };
+                    }
+                }
+            }
+        } else {
+            while hi < cks.len() && cks[hi].ts <= s_c {
+                wo.add(cks[hi].camp, di);
+                hi += 1;
+            }
+            while lo < hi && cks[lo].ts < start {
+                wo.remove(cks[lo].camp, last_day, ndays);
+                lo += 1;
+            }
         }
         let credit = if lo < hi {
             let mts = cks[hi - 1].ts;
@@ -1582,7 +1612,9 @@ fn person_sessions(
         cell[1] += purchased as i64;
         cell[2] += rev;
         // count this session; active campaigns are credited in bulk when they deactivate
-        wo.cum[di] += 1;
+        if !direct {
+            wo.cum[di] += 1;
+        }
         if first_day == usize::MAX {
             first_day = di;
         }
@@ -1600,6 +1632,9 @@ fn person_sessions(
             a_rev = 0;
         }
         i = j;
+    }
+    if direct {
+        return;
     }
     while lo < hi {
         wo.remove(cks[lo].camp, last_day, ndays);
