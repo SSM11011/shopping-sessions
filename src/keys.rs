@@ -393,6 +393,26 @@ pub fn bytes_into(k: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// Bytes of a canonical or long hex key into `out`; returns the length.
+fn bytes_fixed(k: u64, out: &mut [u8; 33]) -> usize {
+    if k & EXOTIC == 0 {
+        let len = if k == 0 { 0 } else { 10 - (k.trailing_zeros() / 6) as usize };
+        for i in 0..10 {
+            out[i] = CHAR[((k >> (54 - 6 * i)) & 63) as usize];
+        }
+        len
+    } else {
+        let (p, hi, lo) = long_parts(k);
+        out[0] = p;
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for i in 0..16 {
+            out[1 + i] = HEX[((hi >> (60 - 4 * i)) & 15) as usize];
+            out[17 + i] = HEX[((lo >> (60 - 4 * i)) & 15) as usize];
+        }
+        33
+    }
+}
+
 #[inline]
 pub fn cmp_key(a: u64, b: u64) -> Ordering {
     if (a | b) & EXOTIC == 0 {
@@ -405,6 +425,13 @@ fn cmp_slow(a: u64, b: u64) -> Ordering {
     // two long hex IDs: hex digits sort like their values, so (prefix, hi, lo) is byte order
     if a & b & LONG != 0 {
         return long_parts(a).cmp(&long_parts(b));
+    }
+    // canonical vs long hex (the common mixed case, e.g. in unions): bytes on the stack, no allocation
+    let fixed = |k: u64| k & EXOTIC == 0 || k & LONG != 0;
+    if fixed(a) && fixed(b) {
+        let (mut x, mut y) = ([0u8; 33], [0u8; 33]);
+        let (nx, ny) = (bytes_fixed(a, &mut x), bytes_fixed(b, &mut y));
+        return x[..nx].cmp(&y[..ny]);
     }
     let (mut x, mut y) = (Vec::with_capacity(40), Vec::with_capacity(40));
     bytes_into(a, &mut x);
@@ -504,6 +531,32 @@ mod tests {
                 let (a, b) = (i, (i * 7 + j * 13) % words.len());
                 assert_eq!(cmp_key(keys[a], keys[b]), words[a].cmp(&words[b]));
                 assert_eq!(keys[a] == keys[b], words[a] == words[b]);
+            }
+        }
+    }
+
+    #[test]
+    fn click_keys_by_value() {
+        let words: Vec<&[u8]> = vec![
+            b"c0123456789abcdef0123456789abcdef", b"c0123456789abcdef0123456789abcdee", b"c0", b"c1", b"czzzzzzzzz",
+            b"d00000000000000000000000000000000", b"cffffffffffffffffffffffffffffffff", b"b0123456789abcdef0123456789abcdef",
+            b"C0123456789abcdef0123456789abcdef", b"c0123456789abcdef0123456789abcde", b"c0123456789abcdef1",
+            b"zffffffffffffffffffffffffffffffff", b"a00000000000000000000000000000000",
+        ];
+        let mut stores = vec![Vec::new(), Vec::new()];
+        let mut keys = Vec::new();
+        for (i, w) in words.iter().enumerate() {
+            let mut p = w.to_vec();
+            p.resize(w.len() + 16, 0);
+            keys.push(unsafe { click_padded(&p[..w.len()], i % 2, &mut stores[i % 2]) });
+        }
+        set_click_store(stores);
+        for (a, &ka) in words.iter().zip(&keys) {
+            let mut out = Vec::new();
+            bytes_into(ka, &mut out);
+            assert_eq!(&out[..], *a);
+            for (b, &kb) in words.iter().zip(&keys) {
+                assert_eq!(cmp_key(ka, kb), a.cmp(b), "{:?} {:?}", a, b);
             }
         }
     }
