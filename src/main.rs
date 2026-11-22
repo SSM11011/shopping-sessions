@@ -1013,29 +1013,29 @@ fn main() {
     });
     let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap()).collect();
     timing(t0, "sessions");
-    {
-        // free the arenas in parallel now: left to process exit, the kernel frees them on one core
-        // (~40 ms on 20M events with 4 KB pages)
-        drop(pe_src);
-        drop(ck_parts);
-        let arenas = &arenas;
-        run_parallel(threads, threads, |_, t| arenas[t].release());
-        timing(t0, "release");
-    }
-
-    // ---- outputs
-    let mut camp_acc = vec![[0i64; 4]; ncol * ndays];
-    for r in &results {
-        for (a, &x) in camp_acc.iter_mut().zip(&r.assist) {
-            a[3] += x as i64;
+    // ---- outputs: campaign_daily is written by one worker while the others free the arenas (left to
+    // process exit, the kernel frees them on one core: ~40 ms on 20M events with 4 KB pages)
+    drop(pe_src);
+    drop(ck_parts);
+    let arenas = &arenas;
+    run_parallel(threads, threads + 1, |_, t| {
+        if t > 0 {
+            arenas[t - 1].release();
+            return;
         }
-        for (a, b) in camp_acc.iter_mut().zip(&r.camp) {
-            for k in 0..4 {
-                a[k] += b[k];
+        let mut camp_acc = vec![[0i64; 4]; ncol * ndays];
+        for r in &results {
+            for (a, &x) in camp_acc.iter_mut().zip(&r.assist) {
+                a[3] += x as i64;
+            }
+            for (a, b) in camp_acc.iter_mut().zip(&r.camp) {
+                for k in 0..4 {
+                    a[k] += b[k];
+                }
             }
         }
-    }
-    out::write_all(&outdir, &results, &camp_acc, &camp_ids, &channels, &cat_names, ws_day, ndays, threads);
+        out::write_all(&outdir, &results, &camp_acc, &camp_ids, &channels, &cat_names, ws_day, ndays, threads);
+    });
     timing(t0, "total");
     if std::env::var_os("SESSIONS_IDSTATS").is_some() {
         let (f, c, g) = keys::long_stats();
