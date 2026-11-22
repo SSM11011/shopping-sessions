@@ -242,8 +242,10 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = match std::fs::read_dir(dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok())
+            // d_type from the directory listing: no stat per file (symlinks/unknown fall back to stat)
+            .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) || e.path().is_file())
             .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "csv") && p.is_file())
+            .filter(|p| p.extension().is_some_and(|x| x == "csv"))
             .collect(),
         Err(_) => Vec::new(),
     };
@@ -505,8 +507,21 @@ fn main() {
     let mut ev_bytes = 0usize;
     let mut ck_bytes = 0usize;
     let mut lk_bytes = 0usize;
-    for (kind, dir) in [(Kind::Event, "events"), (Kind::Link, "links"), (Kind::Click, "clicks")] {
-        for p in list_csv(&data.join(dir)) {
+    let listed: Vec<(Kind, PathBuf)> = [(Kind::Event, "events"), (Kind::Link, "links"), (Kind::Click, "clicks")]
+        .into_iter()
+        .flat_map(|(kind, dir)| list_csv(&data.join(dir)).into_iter().map(move |p| (kind, p)))
+        .collect();
+    // Grow the fd table now, while single-threaded: once threads share it, every growth of the table
+    // (at 64, 128, 256, ... fds) waits in synchronize_rcu() (10-20 ms measured) and stalls every opener
+    // meanwhile. Inputs stay open all run; each worker holds one output file at a time.
+    unsafe {
+        let need = (listed.len() + 3 * threads + 64) as i32;
+        if libc::dup2(2, need) == need {
+            libc::close(need);
+        }
+    }
+    for (kind, p) in listed {
+        {
             let f = File::open(&p).expect("open");
             let len = f.metadata().map(|m| m.len() as usize).unwrap_or(0);
             if len == 0 {
