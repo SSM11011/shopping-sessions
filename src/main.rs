@@ -921,6 +921,8 @@ fn main() {
         (0..nparts).map(|t| (pe_src.iter().map(|s| s.len(t)).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let bbits: u32 = std::env::var("SESSIONS_BBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(14);
+    // 2 radix passes on ts >> COARSE (+ a near-linear fix-up) when every event ts offset fits in 31 bits
+    let coarse = std::env::var_os("SESSIONS_FINE_RADIX").is_none() && we - ws <= 1i64 << 31;
     let ud_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&ud_dir).expect("mkdir");
     run_parallel_fin(threads, nparts, |w, t| {
@@ -938,7 +940,11 @@ fn main() {
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
-        radix_events(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+        if coarse {
+            radix_events_coarse(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+        } else {
+            radix_events(pe_src.iter().map(|s| (s, t)), n_ev, &bucket, bmask + 1, &mut eb, &mut evs, &mut wo.scratch);
+        }
         bucket_scatter(ck_parts.iter().map(|v| (v, t)), |c: &Ck| bucket(c.user), bmask + 1, &mut cb, &mut cks);
         for b in 0..=bmask {
             let ev = &mut evs[eb[b] as usize..eb[b + 1] as usize];
@@ -948,8 +954,14 @@ fn main() {
             // already in ts order within the bucket; group persons if several share it (stable)
             // (person, ts) sort: equal pairs are interchangeable (their input order is arbitrary anyway),
             // so an unstable sort gives the same result as the stable one, without its scratch allocation
-            if ev.len() > 1 && ev.iter().any(|e| e.person != ev[0].person) {
-                ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+            if ev.len() > 1 {
+                if ev.iter().any(|e| e.person != ev[0].person) {
+                    ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                } else if coarse {
+                    // sorted by ts >> COARSE only: finish by exact ts (only events sharing a ~2 s unit can be
+                    // out of order, so this is near-linear)
+                    insertion_sort_ts(ev);
+                }
             }
             let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
             if ck.len() > 1 {
@@ -1137,6 +1149,114 @@ fn radix_events<'a>(
         }
         out.set_len(n);
     }
+}
+
+const COARSE: u32 = 11;
+
+/// Exact ts order for a slice already ordered by ts >> COARSE (inversions only inside one unit, so
+/// insertion sort is near-linear; a pathological unit with many events falls back to a full sort).
+#[inline]
+fn insertion_sort_ts(v: &mut [Pe]) {
+    let mut budget = 8 * v.len() + 64;
+    for i in 1..v.len() {
+        let x = v[i];
+        if v[i - 1].ts <= x.ts {
+            continue;
+        }
+        let mut j = i;
+        while j > 0 && v[j - 1].ts > x.ts {
+            v[j] = v[j - 1];
+            j -= 1;
+        }
+        v[j] = x;
+        let moved = i - j;
+        if moved > budget {
+            v.sort_unstable_by_key(|e| e.ts);
+            return;
+        }
+        budget -= moved;
+    }
+}
+
+/// `radix_events` for ts < 2^31 that orders by (bucket, ts >> COARSE) only: 3 scatter passes instead of 4
+/// (two 10-bit digits of ts >> 11, then the bucket). Same output layout and bucket offsets.
+fn radix_events_coarse<'a>(
+    srcs: impl Iterator<Item = (&'a Parts<Pe>, usize)> + Clone,
+    n: usize,
+    bucket: &impl Fn(u64) -> usize,
+    nb: usize,
+    starts: &mut Vec<u32>,
+    out: &mut Vec<Pe>,
+    tmp: &mut Vec<Pe>,
+) {
+    let mut h0 = [0u32; 1024];
+    let mut h1 = [0u32; 1024];
+    starts.clear();
+    starts.resize(nb + 1, 0);
+    out.clear();
+    out.reserve(n);
+    tmp.clear();
+    tmp.reserve(n);
+    let mut live = 0usize;
+    for (b, bt) in srcs.clone() {
+        b.for_each_slice(bt, |sl| {
+            for e in sl {
+                let ts = e.ts;
+                if ts == NO_TS {
+                    continue;
+                }
+                live += 1;
+                h0[((ts >> COARSE) & 1023) as usize] += 1;
+                h1[((ts >> (COARSE + 10)) & 1023) as usize] += 1;
+                starts[bucket(e.person) + 1] += 1;
+            }
+        });
+    }
+    let n = live;
+    fn excl(h: &mut [u32]) {
+        let mut s = 0;
+        for c in h.iter_mut() {
+            let x = *c;
+            *c = s;
+            s += x;
+        }
+    }
+    excl(&mut h0);
+    excl(&mut h1);
+    for i in 0..nb {
+        starts[i + 1] += starts[i];
+    }
+    unsafe {
+        let o = out.as_mut_ptr();
+        let t = tmp.as_mut_ptr();
+        for (b, bt) in srcs {
+            b.for_each_slice(bt, |sl| {
+                for e in sl {
+                    if e.ts == NO_TS {
+                        continue;
+                    }
+                    let k = ((e.ts >> COARSE) & 1023) as usize;
+                    *t.add(h0[k] as usize) = *e;
+                    h0[k] += 1;
+                }
+            });
+        }
+        for i in 0..n {
+            let e = *t.add(i);
+            let k = ((e.ts >> (COARSE + 10)) & 1023) as usize;
+            *o.add(h1[k] as usize) = e;
+            h1[k] += 1;
+        }
+        let mut pos: Vec<u32> = starts[..nb].to_vec();
+        for i in 0..n {
+            let e = *o.add(i);
+            let k = bucket(e.person);
+            *t.add(pos[k] as usize) = e;
+            pos[k] += 1;
+        }
+        tmp.set_len(n);
+    }
+    std::mem::swap(out, tmp);
 }
 
 fn bucket_scatter<'a, T: Copy + 'a>(
@@ -1554,6 +1674,27 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn coarse_fixup_sorts() {
+        let mut x: u64 = 5;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for case in 0..200 {
+            let n = (rnd() % 3000) as usize;
+            // few units (case odd: everything in one unit, reversed -> exercises the fallback)
+            let mut v: Vec<Pe> = (0..n)
+                .map(|i| Pe { person: 1, ts: if case % 2 == 1 { (n - i) as u32 } else { (rnd() % 100_000) as u32 }, pc: i as u32 })
+                .collect();
+            v.sort_by_key(|e| e.ts >> COARSE);
+            insertion_sort_ts(&mut v);
+            assert!(v.windows(2).all(|w| w[0].ts <= w[1].ts));
+        }
+    }
+
     #[test]
     fn nummap_padded_matches() {
         let mut m = NumMap::new(b"p");
