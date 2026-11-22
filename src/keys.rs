@@ -314,6 +314,54 @@ pub unsafe fn eid_padded(s: &[u8]) -> (u64, u64, u64) {
     (intern(s), 0, 0)
 }
 
+/// Deferred key, first half: like `key_padded`, but a long hex ID comes back unresolved as
+/// (LONG_EID | prefix, hi, lo) with its table slot prefetched; `resolve` finishes it a few lines later,
+/// so the table miss overlaps parsing. Reads 16 bytes like `key_padded`.
+#[inline(always)]
+pub unsafe fn key_deferred(s: &[u8]) -> (u64, u64, u64) {
+    if let Some(k) = unsafe { pack16(s) } {
+        return (k, 0, 0);
+    }
+    if let Some((p, hi, lo)) = parse_long(s) {
+        if let Some(t) = LONG_TABLE.get() {
+            let i = long_slot0(p, hi, lo) & t.mask;
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                use std::arch::x86_64::*;
+                let a = t.slots.as_ptr().add(i) as *const i8;
+                _mm_prefetch(a, _MM_HINT_T0);
+                _mm_prefetch(a.add(std::mem::size_of::<Slot>() - 1), _MM_HINT_T0);
+            }
+        }
+        return (LONG_EID | p as u64, hi, lo);
+    }
+    (intern(s), 0, 0)
+}
+
+/// Deferred key, second half: the final key of a `key_deferred` result.
+#[inline(always)]
+pub fn resolve(k: u64, hi: u64, lo: u64) -> u64 {
+    if k & LONG_EID != LONG_EID {
+        return k;
+    }
+    resolve_long((k & 0xFF) as u8, hi, lo)
+}
+
+#[inline(never)]
+fn resolve_long(p: u8, hi: u64, lo: u64) -> u64 {
+    if let Some(k) = long_key(p, hi, lo) {
+        return k;
+    }
+    let mut b = vec![p];
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for w in [hi, lo] {
+        for i in (0..16).rev() {
+            b.push(HEX[((w >> (4 * i)) & 15) as usize]);
+        }
+    }
+    intern(&b)
+}
+
 /// Same as `key`, but reads 16 bytes from s.as_ptr(): the caller guarantees they are readable
 /// (fields live in a buffer with zero padding after the data).
 #[inline(always)]

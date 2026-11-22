@@ -32,7 +32,10 @@ struct Ev {
     eid: u64,
     ehi: u64,
     elo: u64,
+    /// user key, possibly deferred (keys::key_deferred; uhi/ulo hold a pending long ID until resolved)
     user: u64,
+    uhi: u64,
+    ulo: u64,
     ingest: u32,
     ts: u32,
     /// price (low 24 bits, 0 unless a purchase) | category << 24
@@ -667,6 +670,9 @@ fn main() {
     // miss overlaps with parsing the following lines. Clicks need no dedup: they go straight to person
     // partitions; events go to event_id partitions for dedup.
     const R: usize = 32;
+    // ring lags: resolve a deferred user key at RD, prefetch its link slot at RD + RB, emit at R
+    const RD: usize = 8;
+    const RB: usize = 12;
     let main_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind != Kind::Link).collect();
     run_parallel_fin(threads, main_tasks.len(), |w, t| {
         let task = main_tasks[t];
@@ -679,7 +685,7 @@ fn main() {
         let buf: &[u8] = &own;
         match task.kind {
             Kind::Event => {
-                let mut ring = [Ev { eid: 0, ehi: 0, elo: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
+                let mut ring = [Ev { eid: 0, ehi: 0, elo: 0, user: 0, uhi: 0, ulo: 0, ingest: 0, ts: 0, pc: 0 }; R];
                 let mut rh = [0u64; R];
                 let mut rn = 0usize;
                 let base = arena.base() as usize;
@@ -717,11 +723,8 @@ fn main() {
                             push_dk(o, arena, pshift, &ev, NO_REF);
                             return;
                         }
-                        let h = hash(ev.user);
-                        lmap.prefetch_bloom(h);
-                        if rn >= R / 2 {
-                            lmap.prefetch_h(rh[(rn - R / 2) & (R - 1)]);
-                        }
+                        // stages by lag: 0 parse (long user slot prefetched), RD resolve the user key +
+                        // Bloom prefetch, RD + RB link-slot prefetch, R person + emit
                         let slot = rn & (R - 1);
                         if rn >= R {
                             let old = ring[slot];
@@ -729,10 +732,25 @@ fn main() {
                             emit(o, arena, pshift, base, wref, old, person);
                         }
                         ring[slot] = ev;
-                        rh[slot] = h;
                         rn += 1;
+                        if rn > RD {
+                            let s = (rn - 1 - RD) & (R - 1);
+                            let e = &mut ring[s];
+                            e.user = keys::resolve(e.user, e.uhi, e.ulo);
+                            let h = hash(e.user);
+                            rh[s] = h;
+                            lmap.prefetch_bloom(h);
+                        }
+                        if rn > RD + RB {
+                            lmap.prefetch_h(rh[(rn - 1 - RD - RB) & (R - 1)]);
+                        }
                     }
                 });
+                for k in rn.saturating_sub(RD)..rn {
+                    let e = &mut ring[k & (R - 1)];
+                    e.user = keys::resolve(e.user, e.uhi, e.ulo);
+                    rh[k & (R - 1)] = hash(e.user);
+                }
                 for k in rn.saturating_sub(R)..rn {
                     let old = ring[k & (R - 1)];
                     let person = lmap.person_h(old.user, rh[k & (R - 1)]);
@@ -741,6 +759,7 @@ fn main() {
             }
             Kind::Click => {
                 let mut ring = [Ck { user: 0, click: 0, ts: 0, camp: 0 }; R];
+                let mut rl = [(0u64, 0u64); R];
                 let mut rh = [0u64; R];
                 let mut rn = 0usize;
                 scan::lines::<4>(&buf, start, end, #[inline(always)] |f| {
@@ -752,17 +771,14 @@ fn main() {
                     if t < ws - WEEK || t >= we {
                         return;
                     }
+                    let (user, uhi, ulo) = unsafe { keys::key_deferred(f[1]) };
                     let c = Ck {
-                        user: unsafe { keys::key_padded(f[1]) },
+                        user,
                         click: unsafe { keys::click_padded(f[0], w, &mut o.lclk) },
                         ts: (t - (ws - WEEK)) as u32,
                         camp,
                     };
-                    let h = hash(c.user);
-                    lmap.prefetch_bloom(h);
-                    if rn >= R / 2 {
-                        lmap.prefetch_h(rh[(rn - R / 2) & (R - 1)]);
-                    }
+                    // same stages as the event ring
                     let slot = rn & (R - 1);
                     if rn >= R {
                         let mut old = ring[slot];
@@ -770,9 +786,24 @@ fn main() {
                         o.ck.push(arena, part_of(old.user), old);
                     }
                     ring[slot] = c;
-                    rh[slot] = h;
+                    rl[slot] = (uhi, ulo);
                     rn += 1;
+                    if rn > RD {
+                        let s = (rn - 1 - RD) & (R - 1);
+                        ring[s].user = keys::resolve(ring[s].user, rl[s].0, rl[s].1);
+                        let h = hash(ring[s].user);
+                        rh[s] = h;
+                        lmap.prefetch_bloom(h);
+                    }
+                    if rn > RD + RB {
+                        lmap.prefetch_h(rh[(rn - 1 - RD - RB) & (R - 1)]);
+                    }
                 });
+                for k in rn.saturating_sub(RD)..rn {
+                    let s = k & (R - 1);
+                    ring[s].user = keys::resolve(ring[s].user, rl[s].0, rl[s].1);
+                    rh[s] = hash(ring[s].user);
+                }
                 for k in rn.saturating_sub(R)..rn {
                     let mut old = ring[k & (R - 1)];
                     old.user = lmap.person_h(old.user, rh[k & (R - 1)]);
@@ -1364,9 +1395,9 @@ fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> 
         }
         None => (i64::MAX, u32::MAX),
     };
-    let mut ev = Ev { eid, ehi, elo, user: 0, ingest: ing32, ts: NO_TS, pc: 0 };
+    let mut ev = Ev { eid, ehi, elo, user: 0, uhi: 0, ulo: 0, ingest: ing32, ts: NO_TS, pc: 0 };
     if let Some(v) = validate(ctx, tsf, f, ingest) {
-        ev.user = unsafe { keys::key_padded(f[1]) };
+        (ev.user, ev.uhi, ev.ulo) = unsafe { keys::key_deferred(f[1]) };
         ev.ts = v.0;
         ev.pc = v.1 | (v.2 << 24);
     }
