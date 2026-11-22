@@ -510,6 +510,8 @@ fn main() {
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
+    // long hex IDs (1 in 8 distinct IDs of each kind): sized for 1 in 6 of every event, click and link ID
+    keys::init_long((est_rows + est_clicks + lk_bytes / 10) / 6);
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     arena::decide_thp(threads);
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by

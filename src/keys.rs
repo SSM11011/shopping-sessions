@@ -4,10 +4,157 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
 pub const EXOTIC: u64 = 1 << 63;
+/// Exotic sub-space: a long hex ID (`[a-z]` + 32 `[0-9a-f]`) held in the lock-free `Long` table;
+/// the low bits are its slot. Without this bit an exotic key indexes the general interner.
+pub const LONG: u64 = 1 << 62;
 pub const EMPTY: u64 = u64::MAX;
+
+// ---------------- long hex IDs: lock-free open-addressing table of (prefix, hi, lo)
+//
+// A slot never moves once filled, so its index is a stable, unique key. Insert: CAS hi 0 -> BUSY,
+// write lo and the prefix, publish hi (release). hi values 0 and BUSY are reserved: such an ID goes to
+// the general interner, as does any ID whose probe sequence finds no match and no free slot within
+// MAX_PROBE (the table only fills, so that outcome is the same for every later lookup of that ID).
+const BUSY: u64 = 1;
+const MAX_PROBE: usize = 128;
+
+struct Long {
+    mask: usize,
+    hi: Vec<AtomicU64>,
+    lo: Vec<AtomicU64>,
+    pre: Vec<AtomicU8>,
+}
+
+static LONG_TABLE: OnceLock<Long> = OnceLock::new();
+
+/// Sizes the long-ID table for about `expected` distinct long IDs (load <= ~2/3). Call once, before
+/// any key is made; without it long IDs use the general interner.
+pub fn init_long(expected: usize) {
+    let cap = (expected * 3 / 2 + 1024).next_power_of_two();
+    let alloc64 = |n: usize| -> Vec<AtomicU64> {
+        // zeroed pages straight from the allocator (fresh mmap): no fill pass
+        let layout = std::alloc::Layout::array::<u64>(n).unwrap();
+        unsafe {
+            let p = std::alloc::alloc_zeroed(layout) as *mut AtomicU64;
+            assert!(!p.is_null(), "long-id table allocation failed");
+            Vec::from_raw_parts(p, n, n)
+        }
+    };
+    let pre = unsafe {
+        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
+        let p = std::alloc::alloc_zeroed(layout) as *mut AtomicU8;
+        assert!(!p.is_null(), "long-id table allocation failed");
+        Vec::from_raw_parts(p, cap, cap)
+    };
+    let _ = LONG_TABLE.set(Long { mask: cap - 1, hi: alloc64(cap), lo: alloc64(cap), pre });
+}
+
+#[inline(always)]
+fn long_slot0(pre: u8, hi: u64, lo: u64) -> usize {
+    let mut x = lo ^ hi.rotate_left(29) ^ (pre as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 32;
+    x = x.wrapping_mul(0xd6e8_feb8_6659_fd93);
+    (x ^ (x >> 32)) as usize
+}
+
+/// Key for a long hex ID given as (prefix byte, 128-bit value), or None -> general interner.
+#[inline]
+fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
+    let t = LONG_TABLE.get()?;
+    if hi <= BUSY {
+        return None;
+    }
+    let mut i = long_slot0(pre, hi, lo) & t.mask;
+    for _ in 0..MAX_PROBE {
+        let mut h = t.hi[i].load(Acquire);
+        if h == 0 {
+            match t.hi[i].compare_exchange(0, BUSY, Acquire, Acquire) {
+                Ok(_) => {
+                    t.lo[i].store(lo, Relaxed);
+                    t.pre[i].store(pre, Relaxed);
+                    t.hi[i].store(hi, Release);
+                    return Some(EXOTIC | LONG | i as u64);
+                }
+                Err(x) => h = x,
+            }
+        }
+        while h == BUSY {
+            std::hint::spin_loop();
+            h = t.hi[i].load(Acquire);
+        }
+        if h == hi && t.lo[i].load(Relaxed) == lo && t.pre[i].load(Relaxed) == pre {
+            return Some(EXOTIC | LONG | i as u64);
+        }
+        i = (i + 1) & t.mask;
+    }
+    None
+}
+
+#[inline(always)]
+fn long_parts(k: u64) -> (u8, u64, u64) {
+    let t = LONG_TABLE.get().expect("long key without table");
+    let i = (k & !(EXOTIC | LONG)) as usize;
+    (t.pre[i].load(Relaxed), t.hi[i].load(Relaxed), t.lo[i].load(Relaxed))
+}
+
+/// 33 bytes `[a-z][0-9a-f]{32}` -> (prefix, hi, lo); None for any other shape.
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
+    use std::arch::x86_64::*;
+    if s.len() != 33 || !s[0].is_ascii_lowercase() {
+        return None;
+    }
+    unsafe {
+        let v = _mm256_loadu_si256(s.as_ptr().add(1) as *const __m256i);
+        let d = _mm256_sub_epi8(v, _mm256_set1_epi8(b'0' as i8));
+        let l = _mm256_sub_epi8(v, _mm256_set1_epi8(b'a' as i8));
+        let is_d = _mm256_cmpeq_epi8(_mm256_min_epu8(d, _mm256_set1_epi8(9)), d);
+        let is_l = _mm256_cmpeq_epi8(_mm256_min_epu8(l, _mm256_set1_epi8(5)), l);
+        if _mm256_movemask_epi8(_mm256_or_si256(is_d, is_l)) != -1 {
+            return None;
+        }
+        // nibble = digit value, or letter value + 10
+        let nib = _mm256_or_si256(_mm256_and_si256(is_d, d), _mm256_andnot_si256(is_d, _mm256_add_epi8(l, _mm256_set1_epi8(10))));
+        // pairs (high nibble first) -> bytes in u16 lanes, then pack to 16 bytes in order
+        let w = _mm256_maddubs_epi16(nib, _mm256_set1_epi16(0x0110));
+        let packed = _mm256_packus_epi16(w, w); // per 128-bit lane: 8 bytes, repeated
+        let a = _mm256_extract_epi64::<0>(packed) as u64; // bytes 0..8 of the value (lane 0)
+        let b = _mm256_extract_epi64::<2>(packed) as u64; // bytes 8..16 (lane 1)
+        Some((s[0], u64::from_be(a.to_le()), u64::from_be(b.to_le())))
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
+    if s.len() != 33 || !s[0].is_ascii_lowercase() {
+        return None;
+    }
+    let mut v: u128 = 0;
+    for &c in &s[1..] {
+        let n = match c {
+            b'0'..=b'9' => c - b'0',
+            b'a'..=b'f' => c - b'a' + 10,
+            _ => return None,
+        };
+        v = (v << 4) | n as u128;
+    }
+    Some((s[0], (v >> 64) as u64, v as u64))
+}
+
+#[inline(always)]
+fn exotic_key(s: &[u8]) -> u64 {
+    if let Some((p, hi, lo)) = parse_long(s) {
+        if let Some(k) = long_key(p, hi, lo) {
+            return k;
+        }
+    }
+    intern(s)
+}
 
 static CODE: [u8; 256] = {
     let mut t = [0u8; 256];
@@ -82,7 +229,7 @@ fn intern(s: &[u8]) -> u64 {
 pub fn key(s: &[u8]) -> u64 {
     match pack(s) {
         Some(k) => k,
-        None => intern(s),
+        None => exotic_key(s),
     }
 }
 
@@ -92,7 +239,7 @@ pub fn key(s: &[u8]) -> u64 {
 pub unsafe fn key_padded(s: &[u8]) -> u64 {
     match unsafe { pack16(s) } {
         Some(k) => k,
-        None => intern(s),
+        None => exotic_key(s),
     }
 }
 
@@ -150,6 +297,15 @@ pub fn bytes_into(k: u64, out: &mut Vec<u8>) {
             }
             out.set_len(out.len() + len);
         }
+    } else if k & LONG != 0 {
+        let (p, hi, lo) = long_parts(k);
+        out.push(p);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for w in [hi, lo] {
+            for i in (0..16).rev() {
+                out.push(HEX[((w >> (4 * i)) & 15) as usize]);
+            }
+        }
     } else {
         let g = interner().lock().unwrap();
         out.extend_from_slice(&g.strs[(k & !EXOTIC) as usize]);
@@ -164,9 +320,12 @@ pub fn cmp_key(a: u64, b: u64) -> Ordering {
     cmp_slow(a, b)
 }
 
-#[cold]
 fn cmp_slow(a: u64, b: u64) -> Ordering {
-    let (mut x, mut y) = (Vec::new(), Vec::new());
+    // two long hex IDs: hex digits sort like their values, so (prefix, hi, lo) is byte order
+    if a & b & LONG != 0 {
+        return long_parts(a).cmp(&long_parts(b));
+    }
+    let (mut x, mut y) = (Vec::with_capacity(40), Vec::with_capacity(40));
     bytes_into(a, &mut x);
     bytes_into(b, &mut y);
     x.cmp(&y)
@@ -210,6 +369,64 @@ mod tests {
             assert_eq!(unsafe { pack16(s) }, pack(s), "{:?}", s);
         }
     }
+    fn scalar_long(s: &[u8]) -> Option<(u8, u64, u64)> {
+        if s.len() != 33 || !s[0].is_ascii_lowercase() {
+            return None;
+        }
+        let mut v: u128 = 0;
+        for &c in &s[1..] {
+            let n = match c {
+                b'0'..=b'9' => c - b'0',
+                b'a'..=b'f' => c - b'a' + 10,
+                _ => return None,
+            };
+            v = (v << 4) | n as u128;
+        }
+        Some((s[0], (v >> 64) as u64, v as u64))
+    }
+
+    #[test]
+    fn long_ids() {
+        init_long(1 << 16);
+        let mut x: u64 = 11;
+        let mut rnd = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let alpha = b"0123456789abcdefABCDEFgz_ ";
+        let mut words: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..20_000 {
+            let n = if rnd() % 4 == 0 { (rnd() % 40) as usize } else { 33 };
+            let mut w = vec![b"eukEz9"[(rnd() % 6) as usize]];
+            for _ in 1..n.max(1) {
+                let c = if rnd() % 50 == 0 { alpha[(rnd() % alpha.len() as u64) as usize] } else { b"0123456789abcdef"[(rnd() % 16) as usize] };
+                w.push(c);
+            }
+            assert_eq!(parse_long(&w), scalar_long(&w), "{:?}", w);
+            words.push(w);
+        }
+        words.push(b"u00000000000000000000000000000000".to_vec());
+        words.push(b"u0000000000000000ffffffffffffffff".to_vec());
+        words.push(b"u4k2nn2cj".to_vec());
+        words.push(b"uffffffffffffffffffffffffffffffff".to_vec());
+        let keys: Vec<u64> = words.iter().map(|w| key(w)).collect();
+        for (w, &k) in words.iter().zip(&keys) {
+            assert_eq!(key(w), k);
+            let mut out = Vec::new();
+            bytes_into(k, &mut out);
+            assert_eq!(&out, w);
+        }
+        for i in 0..2000 {
+            for j in 0..60 {
+                let (a, b) = (i, (i * 7 + j * 13) % words.len());
+                assert_eq!(cmp_key(keys[a], keys[b]), words[a].cmp(&words[b]));
+                assert_eq!(keys[a] == keys[b], words[a] == words[b]);
+            }
+        }
+    }
+
     #[test]
     fn order_and_roundtrip() {
         let words: Vec<&[u8]> = vec![
