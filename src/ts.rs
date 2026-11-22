@@ -112,20 +112,26 @@ fn le64(s: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(s[at..at + 8].try_into().unwrap())
 }
 
-/// "hh:mm:ss" at s[11..19] -> seconds of day, validated.
+/// "hh:mm:ss" at s[11..19] -> seconds of day, validated. One SWAR pass checks the colons, that every
+/// other byte is a digit, and the tens digits' ranges (h <= 2, m <= 5, s <= 5); only h <= 23 remains.
 #[inline(always)]
 fn time_of_day(s: &[u8]) -> Option<i64> {
     const T: u64 = 0x3030_3a30_303a_3030;
     const DIG: u64 = 0xF0F0_00F0_F000_F0F0;
     const COL: u64 = 0x0000_FF00_00FF_0000;
+    // per byte (low first): h tens +13, h ones +6, -, m tens +10, m ones +6, -, s tens +10, s ones +6
+    const ADJ: u64 = 0x060A_0006_0A00_060D;
     let t = le64(s, 11);
-    if (t ^ T) & COL != 0 || (t & DIG) != (T & DIG) || (t.wrapping_add(0x0606_0006_0600_0606) & DIG) != (T & DIG) {
+    if ((t ^ T) & COL) | ((t & DIG) ^ (T & DIG)) | ((t.wrapping_add(ADJ) & DIG) ^ (T & DIG)) != 0 {
         return None;
     }
     let d = t.wrapping_sub(T);
-    let b = |i: u32| ((d >> (8 * i)) & 0xFF) as i64;
-    let (h, m, sec) = (b(0) * 10 + b(1), b(3) * 10 + b(4), b(6) * 10 + b(7));
-    if h > 23 || m > 59 || sec > 59 {
+    // pairs: byte 0 = h, byte 3 = m, byte 6 = s (no carries: each byte <= 99)
+    let x = d.wrapping_mul(10).wrapping_add(d >> 8);
+    let h = (x & 0xFF) as i64;
+    let m = ((x >> 24) & 0xFF) as i64;
+    let sec = ((x >> 48) & 0xFF) as i64;
+    if h > 23 {
         return None;
     }
     Some(h * 3600 + m * 60 + sec)
