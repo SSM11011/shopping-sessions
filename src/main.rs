@@ -402,6 +402,8 @@ struct ParseOut {
     /// payload rows, by person partition
     pe: Parts<Pe>,
     ck: Parts<Ck>,
+    /// (hi, lo) of this worker's long hex click_ids (see keys::LV)
+    lclk: Vec<[u64; 2]>,
     links: Vec<(u64, u64)>,
     tsf: ts::Fast,
 }
@@ -551,10 +553,10 @@ fn main() {
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
-    // long hex user/click/link IDs (1 in 8 distinct IDs; event_ids never enter this table). Measured
-    // ~0.8M at 20M events (est_clicks 6.8M); this sizes for ~1.5x that at load <= 2/3, and a full probe
-    // window still falls back to the general interner.
-    keys::init_long((est_clicks + lk_bytes / 20 + est_rows / 16) / 8);
+    // long hex user/link IDs (1 in 8 distinct IDs; event_ids and click_ids never enter this table).
+    // Sized for the link IDs plus ~E/16 distinct users at load <= 2/3; a full probe window still falls
+    // back to the general interner.
+    keys::init_long((lk_bytes / 20 + est_rows / 16) / 8);
     run_parallel(threads, threads, |_, t| keys::touch_long(t, threads));
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     arena::decide_thp(threads);
@@ -580,6 +582,7 @@ fn main() {
                 dkl: Parts::new(nparts, est_rows / 4 / nparts / threads),
                 pe: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
                 ck: Parts::new(nparts, est_clicks * 5 / 4 / nparts / threads),
+                lclk: Vec::new(),
                 // link rows are >= 4 bytes but ~21 in practice; a generous one-shot capacity avoids the
                 // realloc ladder (untouched capacity is never faulted in)
                 links: Vec::with_capacity(lk_bytes / 12 / threads * 2 + 1024),
@@ -751,7 +754,7 @@ fn main() {
                     }
                     let c = Ck {
                         user: unsafe { keys::key_padded(f[1]) },
-                        click: unsafe { keys::key_padded(f[0]) },
+                        click: unsafe { keys::click_padded(f[0], w, &mut o.lclk) },
                         ts: (t - (ws - WEEK)) as u32,
                         camp,
                     };
@@ -786,6 +789,7 @@ fn main() {
         o.dk.flush_wc();
     });
     let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    keys::set_click_store(outs.iter_mut().map(|o| std::mem::take(&mut o.lclk)).collect());
     for o in &mut outs {
         o.buf = Vec::new();
     }

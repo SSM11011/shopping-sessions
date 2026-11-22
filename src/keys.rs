@@ -125,8 +125,40 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
     None
 }
 
+/// Long hex click_id carried by value (never in the table): EXOTIC | LONG | LV | (prefix - 'a') << 56 |
+/// worker << 48 | index into that worker's click store, which holds (hi, lo). Click ids only order
+/// clicks; they are never linked, so they need no table slot.
+pub const LV: u64 = 1 << 61;
+static CLICK_STORE: OnceLock<Vec<Vec<[u64; 2]>>> = OnceLock::new();
+
+/// Publishes the per-worker long click_id stores (index = worker). Call once, after parsing and before
+/// any comparison of click keys.
+pub fn set_click_store(v: Vec<Vec<[u64; 2]>>) {
+    let _ = CLICK_STORE.set(v);
+}
+
+/// Click-id key: a long hex click_id goes by value into `store` (worker `w` < 256), anything else as
+/// `key`. Reads 16 bytes like `key_padded`.
+#[inline(always)]
+pub unsafe fn click_padded(s: &[u8], w: usize, store: &mut Vec<[u64; 2]>) -> u64 {
+    if let Some(k) = unsafe { pack16(s) } {
+        return k;
+    }
+    if let Some((p, hi, lo)) = parse_long(s) {
+        let k = EXOTIC | LONG | LV | ((p - b'a') as u64) << 56 | (w as u64) << 48 | store.len() as u64;
+        store.push([hi, lo]);
+        return k;
+    }
+    intern(s)
+}
+
 #[inline(always)]
 fn long_parts(k: u64) -> (u8, u64, u64) {
+    if k & LV != 0 {
+        let st = CLICK_STORE.get().expect("long click key without store");
+        let [hi, lo] = st[((k >> 48) & 0xFF) as usize][(k & ((1 << 48) - 1)) as usize];
+        return (b'a' + ((k >> 56) & 31) as u8, hi, lo);
+    }
     let t = LONG_TABLE.get().expect("long key without table");
     let sl = &t.slots[(k & !(EXOTIC | LONG)) as usize];
     (sl.pre.load(Relaxed) as u8, sl.hi.load(Relaxed), sl.lo.load(Relaxed))
