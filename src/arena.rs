@@ -316,7 +316,6 @@ impl<T: Copy> Parts<T> {
     const PER: usize = BLOCK / std::mem::size_of::<T>();
 
     pub fn new(n: usize, rows_each: usize) -> Self {
-        assert!(BLOCK % std::mem::size_of::<T>() == 0);
         let cap = rows_each * std::mem::size_of::<T>() / BLOCK + 2;
         Parts { curs: vec![std::ptr::null_mut(); n], lists: (0..n).map(|_| Vec::with_capacity(cap)).collect() }
     }
@@ -324,7 +323,10 @@ impl<T: Copy> Parts<T> {
     #[inline(always)]
     pub fn push_ptr(&mut self, arena: &Arena, part: usize, v: T) -> *mut T {
         let mut c = unsafe { *self.curs.get_unchecked(part) };
-        if (c as usize) & (BLOCK - 1) == 0 {
+        // a block is full when the next row would not fit (offset 0 = full block of a size dividing
+        // BLOCK, or no block yet); for sizes dividing BLOCK the second test folds away
+        let off = (c as usize) & (BLOCK - 1);
+        if off == 0 || off + std::mem::size_of::<T>() > BLOCK {
             c = self.grow(arena, part);
         }
         unsafe {

@@ -27,7 +27,16 @@ pub fn write_user(path: &Path, r: &WorkerOut, cat_names: &[Vec<u8>]) {
             Column { name: "day", date: true, data: Data::I32(&r.day) },
             Column { name: "sessions", date: false, data: Data::I32(&r.sessions) },
             Column { name: "events", date: false, data: Data::I32(&r.events) },
-            Column { name: "revenue_cents", date: false, data: Data::I64(&r.revenue) },
+            Column {
+                name: "revenue_cents",
+                date: false,
+                // any integer width is accepted: 4 bytes when every value in this file fits
+                data: if r.revenue.iter().all(|&x| x >= i32::MIN as i64 && x <= i32::MAX as i64) {
+                    Data::I64As32(&r.revenue)
+                } else {
+                    Data::I64(&r.revenue)
+                },
+            },
             Column { name: "top_category", date: false, data: Data::Str { bytes: &tb, ends: &te, present: Some(&present) } },
         ],
     )

@@ -67,9 +67,8 @@ fn price_of(pc: u32) -> u32 {
     pc & 0xFF_FFFF
 }
 
-/// A valid click. `user` becomes the person after link resolution. 32 bytes (divides BLOCK).
+/// A valid click. `user` becomes the person after link resolution. 24 bytes.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
 struct Ck {
     user: u64,
     click: u64,
