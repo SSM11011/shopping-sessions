@@ -1238,13 +1238,19 @@ fn radix_events<'a>(
             *t.add(h2[k] as usize) = e;
             h2[k] += 1;
         }
-        let mut pos: Vec<u32> = starts[..nb].to_vec();
+        // starts[..nb] serve as the cursors (no allocation); each ends at the next bucket's start
+        let pos = starts.as_mut_ptr();
         for i in 0..n {
             let e = *t.add(i);
             let k = bucket(e.person);
-            *o.add(pos[k] as usize) = e;
-            pos[k] += 1;
+            let c = pos.add(k);
+            *o.add(*c as usize) = e;
+            *c += 1;
         }
+        for i in (1..nb).rev() {
+            *pos.add(i) = *pos.add(i - 1);
+        }
+        *pos = 0;
         out.set_len(n);
     }
 }
@@ -1383,13 +1389,19 @@ fn radix_coarse<'a, T: Row + 'a>(
             *o.add(h1[k] as usize) = e;
             h1[k] += 1;
         }
-        let mut pos: Vec<u32> = starts[..nb].to_vec();
+        // starts[..nb] serve as the cursors (no allocation); each ends at the next bucket's start
+        let pos = starts.as_mut_ptr();
         for i in 0..n {
             let e = *o.add(i);
             let k = bucket(e.key());
-            *t.add(pos[k] as usize) = e;
-            pos[k] += 1;
+            let c = pos.add(k);
+            *t.add(*c as usize) = e;
+            *c += 1;
         }
+        for i in (1..nb).rev() {
+            *pos.add(i) = *pos.add(i - 1);
+        }
+        *pos = 0;
         tmp.set_len(n);
     }
     std::mem::swap(out, tmp);

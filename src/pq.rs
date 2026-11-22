@@ -290,8 +290,8 @@ pub fn write(path: &Path, rows: usize, cols: &[Column<'_>]) -> std::io::Result<(
     let mut buf: Vec<u8> = Vec::with_capacity(rows * 16 + 4096);
     buf.extend_from_slice(b"PAR1");
     let mut metas = Vec::new();
-    let mut page = Vec::new();
-    let mut i64s: Vec<i64> = Vec::new();
+    let mut page = Vec::with_capacity(rows.min(PAGE_ROWS) * 8 + 4096);
+    let mut i64s: Vec<i64> = Vec::with_capacity(rows.min(PAGE_ROWS));
     for c in cols {
         let offset = buf.len() as i64;
         let (ty, optional, enc) = match &c.data {
