@@ -998,6 +998,15 @@ fn main() {
     });
     let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap()).collect();
     timing(t0, "sessions");
+    {
+        // free the arenas in parallel now: left to process exit, the kernel frees them on one core
+        // (~40 ms on 20M events with 4 KB pages)
+        drop(pe_src);
+        drop(ck_parts);
+        let arenas = &arenas;
+        run_parallel(threads, threads, |_, t| arenas[t].release());
+        timing(t0, "release");
+    }
 
     // ---- outputs
     let mut camp_acc = vec![[0i64; 4]; ncol * ndays];

@@ -186,6 +186,16 @@ impl Arena {
     }
 }
 
+impl Arena {
+    /// Free every page the arena touched (the arena must not be read afterwards). MADV_DONTNEED only
+    /// takes the mmap lock shared, so all workers can free their arenas at once; munmap (or the exit
+    /// path) needs it exclusive and frees the pages on one core.
+    pub fn release(&self) {
+        let used = (self.used.load(Relaxed) + (2 << 20) - 1) & !((2 << 20) - 1);
+        unsafe { libc::madvise(self.base as *mut libc::c_void, used.min(self.cap), libc::MADV_DONTNEED) };
+    }
+}
+
 impl Drop for Arena {
     fn drop(&mut self) {
         // only reached when a reservation set is abandoned; the run itself exits without dropping
