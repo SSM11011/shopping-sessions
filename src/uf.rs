@@ -13,12 +13,26 @@ pub struct Uf {
 }
 
 impl Uf {
-    pub fn new(max_ids: usize) -> Self {
+    /// The table fill (EMPTY keys, zero parents) runs on all workers through `par`.
+    pub fn new(max_ids: usize, par: &dyn Fn(usize, &(dyn Fn(usize) + Sync))) -> Self {
         let cap = (max_ids + 1).next_power_of_two().max(64);
-        let mut keys = Vec::with_capacity(cap);
-        keys.resize_with(cap, || AtomicU64::new(EMPTY));
-        let mut parent = Vec::with_capacity(cap);
-        parent.resize_with(cap, || AtomicU32::new(0));
+        let mut keys: Vec<AtomicU64> = Vec::with_capacity(cap);
+        let mut parent: Vec<AtomicU32> = Vec::with_capacity(cap);
+        let (kp, pp) = (SendPtr(keys.as_mut_ptr()), SendPtr(parent.as_mut_ptr()));
+        let per = 1 << 16;
+        par(cap.div_ceil(per), &|t| {
+            let (kp, pp) = (&kp, &pp);
+            for i in t * per..((t + 1) * per).min(cap) {
+                unsafe {
+                    kp.0.add(i).write(AtomicU64::new(EMPTY));
+                    pp.0.add(i).write(AtomicU32::new(0));
+                }
+            }
+        });
+        unsafe {
+            keys.set_len(cap);
+            parent.set_len(cap);
+        }
         Uf { mask: cap - 1, keys, parent }
     }
 

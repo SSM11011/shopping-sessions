@@ -416,58 +416,62 @@ fn main() {
     let we = manifest_ms(&manifest, "\"window_end\"");
     assert!(we > ws && we - ws + WEEK < u32::MAX as i64, "window too long");
 
-    let prod_bytes = read_small(&data.join("products.csv"));
-    // one pass: product -> provisional category id (first-seen order), no per-row allocations
-    let mut prov: HashMap<Vec<u8>, u32> = HashMap::new();
-    let mut prov_names: Vec<Vec<u8>> = Vec::new();
-    let mut prod_rows: Vec<(std::ops::Range<usize>, u32)> = Vec::new();
-    let base = prod_bytes.as_ptr() as usize;
-    let mut pbuf = prod_bytes.clone();
-    pbuf.extend_from_slice(&[0u8; scan::PAD]);
-    let pstart = memchr::memchr(b'\n', &prod_bytes).map_or(prod_bytes.len(), |p| p + 1);
-    let pb = pbuf.as_ptr() as usize;
-    let _ = base;
-    scan::lines::<2>(&pbuf, pstart, prod_bytes.len(), |[p, c]| {
-        let id = match prov.get(*c) {
-            Some(&i) => i,
-            None => {
-                let i = prov_names.len() as u32;
-                prov.insert(c.to_vec(), i);
-                prov_names.push(c.to_vec());
-                i
-            }
-        };
-        let off = p.as_ptr() as usize - pb;
-        prod_rows.push((off..off + p.len(), id));
-    });
-    let mut cat_names: Vec<Vec<u8>> = prov_names.clone();
-    cat_names.push(b"unknown".to_vec());
-    cat_names.sort();
-    cat_names.dedup();
-    let cat_id: HashMap<Vec<u8>, u32> =
-        cat_names.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
-    let remap: Vec<u32> = prov_names.iter().map(|c| cat_id[c]).collect();
-    let mut products = NumMap::new(b"p");
-    for (r, id) in &prod_rows {
-        products.insert(&pbuf[r.clone()], remap[*id as usize]);
-    }
-    products.narrow();
-    let unknown_cat = cat_id[&b"unknown"[..]];
-    assert!(cat_names.len() <= 256, "more than 255 categories");
-
-    let camp_bytes = read_small(&data.join("campaigns.csv"));
-    let mut camp_ids: Vec<Vec<u8>> = Vec::new();
-    let mut channels: Vec<Vec<u8>> = Vec::new();
-    let mut campaigns = NumMap::new(b"c_");
-    small_lines::<2>(&camp_bytes, |[c, ch]| {
-        if campaigns.get(c).is_none() {
-            campaigns.insert(c, camp_ids.len() as u32);
-            camp_ids.push(c.to_vec());
-            channels.push(ch.to_vec());
+    // products/campaigns are only needed once events are parsed: built as one task of the link phase
+    let build_lookups = || {
+        let prod_bytes = read_small(&data.join("products.csv"));
+        // one pass: product -> provisional category id (first-seen order), no per-row allocations
+        let mut prov: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut prov_names: Vec<Vec<u8>> = Vec::new();
+        let mut prod_rows: Vec<(std::ops::Range<usize>, u32)> = Vec::new();
+        let base = prod_bytes.as_ptr() as usize;
+        let mut pbuf = prod_bytes.clone();
+        pbuf.extend_from_slice(&[0u8; scan::PAD]);
+        let pstart = memchr::memchr(b'\n', &prod_bytes).map_or(prod_bytes.len(), |p| p + 1);
+        let pb = pbuf.as_ptr() as usize;
+        let _ = base;
+        scan::lines::<2>(&pbuf, pstart, prod_bytes.len(), |[p, c]| {
+            let id = match prov.get(*c) {
+                Some(&i) => i,
+                None => {
+                    let i = prov_names.len() as u32;
+                    prov.insert(c.to_vec(), i);
+                    prov_names.push(c.to_vec());
+                    i
+                }
+            };
+            let off = p.as_ptr() as usize - pb;
+            prod_rows.push((off..off + p.len(), id));
+        });
+        let mut cat_names: Vec<Vec<u8>> = prov_names.clone();
+        cat_names.push(b"unknown".to_vec());
+        cat_names.sort();
+        cat_names.dedup();
+        let cat_id: HashMap<Vec<u8>, u32> =
+            cat_names.iter().enumerate().map(|(i, c)| (c.clone(), i as u32)).collect();
+        let remap: Vec<u32> = prov_names.iter().map(|c| cat_id[c]).collect();
+        let mut products = NumMap::new(b"p");
+        for (r, id) in &prod_rows {
+            products.insert(&pbuf[r.clone()], remap[*id as usize]);
         }
-    });
-    let n_camp = camp_ids.len();
-    let ctx = Ctx { ws, we, products, unknown_cat, campaigns };
+        products.narrow();
+        let unknown_cat = cat_id[&b"unknown"[..]];
+        assert!(cat_names.len() <= 256, "more than 255 categories");
+
+        let camp_bytes = read_small(&data.join("campaigns.csv"));
+        let mut camp_ids: Vec<Vec<u8>> = Vec::new();
+        let mut channels: Vec<Vec<u8>> = Vec::new();
+        let mut campaigns = NumMap::new(b"c_");
+        small_lines::<2>(&camp_bytes, |[c, ch]| {
+            if campaigns.get(c).is_none() {
+                campaigns.insert(c, camp_ids.len() as u32);
+                camp_ids.push(c.to_vec());
+                channels.push(ch.to_vec());
+            }
+        });
+        let n_camp = camp_ids.len();
+        (Ctx { ws, we, products, unknown_cat, campaigns }, cat_names, camp_ids, channels, n_camp)
+    };
+    let lookups: Mutex<Option<(Ctx, Vec<Vec<u8>>, Vec<Vec<u8>>, Vec<Vec<u8>>, usize)>> = Mutex::new(None);
 
     // ---- files & tasks (events first: they are the bulk)
     let chunk: usize = std::env::var("SESSIONS_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(256 << 10);
@@ -531,14 +535,19 @@ fn main() {
     }
     timing(t0, "setup");
     if std::env::var_os("EXP_MICRO").is_some() {
+        let ctx = build_lookups().0;
         micro(&files, &ctx, ws);
         return;
     }
 
     // ---- phase A: links (small) -> lock-free union-find; root = byte-wise smallest ID = person name
     let link_tasks: Vec<&Task> = tasks.iter().filter(|t| t.kind == Kind::Link).collect();
-    run_parallel(threads, link_tasks.len(), |w, t| {
-        let task = link_tasks[t];
+    run_parallel(threads, link_tasks.len() + 1, |w, t| {
+        if t == 0 {
+            *lookups.lock().unwrap() = Some(build_lookups());
+            return;
+        }
+        let task = link_tasks[t - 1];
         let (file, flen) = &files[task.file];
         let mut guard = outs[w].lock().unwrap();
         let o = &mut *guard;
@@ -554,7 +563,7 @@ fn main() {
     });
     timing(t0, "lparse");
     let n_links: usize = outs.iter().map(|o| o.lock().unwrap().links.len()).sum();
-    let uf = uf::Uf::new(2 * n_links);
+    let uf = uf::Uf::new(2 * n_links, &|n, f| run_parallel(threads, n, |_, t| f(t)));
     timing(t0, "ufalloc");
     {
         let guards: Vec<_> = outs.iter().map(|o| o.lock().unwrap()).collect();
@@ -591,6 +600,7 @@ fn main() {
     let lmap = &lmap;
     timing(t0, "links");
 
+    let (ctx, cat_names, camp_ids, channels, n_camp) = lookups.into_inner().unwrap().expect("lookups built");
     // ---- phase B: events and clicks. Persons are resolved here, through a small ring so each link-map
     // miss overlaps with parsing the following lines. Clicks need no dedup: they go straight to person
     // partitions; events go to event_id partitions for dedup.
