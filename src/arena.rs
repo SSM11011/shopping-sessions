@@ -369,8 +369,9 @@ const PF_DIST: usize = 256;
 pub struct Parts<T: Copy> {
     curs: Vec<*mut T>,
     lists: Vec<Vec<*mut T>>,
-    /// software write-combining (16-byte rows only): one 64-byte staging line per partition; a line goes
-    /// to its block with non-temporal stores once full (no read-for-ownership of the destination)
+    /// software write-combining: two 64-byte staging lines per partition (a row may straddle into the
+    /// second); a line goes to its block with non-temporal stores once full (no read-for-ownership of
+    /// the destination)
     stage: Vec<Line>,
 }
 
@@ -380,6 +381,8 @@ struct Line([u8; 64]);
 
 /// Use software write-combining for 16-byte rows.
 pub static WC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// Use it also for the other row sizes (24-byte clicks, 32-byte long-id dedup keys).
+pub static WC_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 unsafe impl<T: Copy + Send> Send for Parts<T> {}
 unsafe impl<T: Copy + Sync> Sync for Parts<T> {}
@@ -392,14 +395,26 @@ impl<T: Copy> Default for Parts<T> {
 
 impl<T: Copy> Parts<T> {
     const PER: usize = BLOCK / std::mem::size_of::<T>();
+    const S: usize = std::mem::size_of::<T>();
 
     pub fn new(n: usize, rows_each: usize) -> Self {
         let cap = rows_each * std::mem::size_of::<T>() / BLOCK + 2;
-        let wc = std::mem::size_of::<T>() == 16 && WC.load(Relaxed);
+        let wc = Self::S <= 64 && WC.load(Relaxed) && (Self::S == 16 || WC_ALL.load(Relaxed));
         Parts {
             curs: vec![std::ptr::null_mut(); n],
             lists: (0..n).map(|_| Vec::with_capacity(cap)).collect(),
-            stage: if wc { vec![Line([0; 64]); n] } else { Vec::new() },
+            stage: if wc { vec![Line([0; 64]); 2 * n] } else { Vec::new() },
+        }
+    }
+
+    /// Copies the staged bytes of partition `part`'s partly filled line (cursor `c`) to their place.
+    #[inline(always)]
+    fn flush_line(&self, part: usize, c: *mut T) {
+        let lo = c as usize & 63;
+        if !c.is_null() && lo != 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(self.stage[2 * part].0.as_ptr(), (c as usize & !63) as *mut u8, lo);
+            }
         }
     }
 
@@ -409,12 +424,7 @@ impl<T: Copy> Parts<T> {
             return;
         }
         for (part, &c) in self.curs.iter().enumerate() {
-            let lo = c as usize & 63;
-            if lo != 0 {
-                unsafe {
-                    std::ptr::copy_nonoverlapping(self.stage[part].0.as_ptr(), (c as usize & !63) as *mut u8, lo);
-                }
-            }
+            self.flush_line(part, c);
         }
         #[cfg(target_arch = "x86_64")]
         unsafe {
@@ -425,23 +435,35 @@ impl<T: Copy> Parts<T> {
     #[inline(always)]
     pub fn push_ptr(&mut self, arena: &Arena, part: usize, v: T) -> *mut T {
         #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
-        if std::mem::size_of::<T>() == 16 && !self.stage.is_empty() {
+        if Self::S <= 64 && !self.stage.is_empty() {
             let mut c = unsafe { *self.curs.get_unchecked(part) };
-            if (c as usize) & (BLOCK - 1) == 0 {
+            let off = (c as usize) & (BLOCK - 1);
+            if off == 0 || off + Self::S > BLOCK {
+                if BLOCK % Self::S != 0 {
+                    // a block's tail line is never completed: write out what it holds
+                    self.flush_line(part, c);
+                }
                 c = self.grow(arena, part);
             }
             unsafe {
                 use std::arch::x86_64::*;
-                let line = self.stage.as_mut_ptr().add(part) as *mut u8;
+                let line = self.stage.as_mut_ptr().add(2 * part) as *mut u8;
                 let lo = c as usize & 63;
-                (line.add(lo) as *mut T).write(v);
-                let n = c.add(1);
-                if n as usize & 63 == 0 {
-                    let dst = (n as usize - 64) as *mut __m256i;
+                (line.add(lo) as *mut T).write_unaligned(v);
+                let end = lo + Self::S;
+                if end >= 64 {
+                    let dst = (c as usize & !63) as *mut __m256i;
                     _mm256_stream_si256(dst, _mm256_load_si256(line as *const __m256i));
                     _mm256_stream_si256(dst.add(1), _mm256_load_si256(line.add(32) as *const __m256i));
+                    if 64 % Self::S != 0 && end > 64 {
+                        // the row's overflow becomes the start of the next line
+                        let a = _mm256_load_si256(line.add(64) as *const __m256i);
+                        let b = _mm256_load_si256(line.add(96) as *const __m256i);
+                        _mm256_store_si256(line as *mut __m256i, a);
+                        _mm256_store_si256(line.add(32) as *mut __m256i, b);
+                    }
                 }
-                *self.curs.get_unchecked_mut(part) = n;
+                *self.curs.get_unchecked_mut(part) = c.add(1);
             }
             return c;
         }

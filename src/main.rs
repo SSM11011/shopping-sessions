@@ -566,6 +566,9 @@ fn main() {
     if std::env::var_os("SESSIONS_NO_WC").is_some() {
         arena::WC.store(false, Ordering::Relaxed);
     }
+    if std::env::var_os("SESSIONS_NO_WC2").is_some() {
+        arena::WC_ALL.store(false, Ordering::Relaxed);
+    }
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
     // a 32-bit ref = worker << 28 | (offset / 16). Twice the estimate is the fallback reservation.
     let full = (4usize << 30) - (2 << 20);
@@ -833,6 +836,8 @@ fn main() {
         let mut o = outs[w].lock().unwrap();
         o.pe.flush_wc();
         o.dk.flush_wc();
+        o.dkl.flush_wc();
+        o.ck.flush_wc();
     });
     let mut outs: Vec<ParseOut> = outs.into_iter().map(|m| m.into_inner().unwrap()).collect();
     keys::set_click_store(outs.iter_mut().map(|o| std::mem::take(&mut o.lclk)).collect());
