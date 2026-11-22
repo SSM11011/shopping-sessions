@@ -152,16 +152,15 @@ pub fn parse8(x: u64) -> u64 {
 #[inline(always)]
 fn digits13(s: &[u8]) -> Option<i64> {
     let a = le64(s, 0);
-    let b = le64(s, 5); // bytes 5..13 (overlaps 5..8)
-    let ok = |x: u64| (x & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030
-        && (x.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) == 0x3030_3030_3030_3030;
-    if !ok(a) || !ok(b) {
+    // bytes 5..13 with the overlap (digits 5..8, already covered by `a`) replaced by '0': the last
+    // 5 digits as an 8-digit number
+    let b = (le64(s, 5) & !0xFF_FFFF) | 0x30_3030;
+    const D: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const Z: u64 = 0x3030_3030_3030_3030;
+    if ((a & D) ^ Z) | ((b & D) ^ Z) | ((a.wrapping_add(0x0606_0606_0606_0606) & D) ^ Z) | ((b.wrapping_add(0x0606_0606_0606_0606) & D) ^ Z) != 0 {
         return None;
     }
-    // value = first 8 digits * 10^5 + last 5 digits; last 5 = parse8(b) mod 10^5 (b holds digits 5..13)
-    let hi = parse8(a);
-    let lo = parse8(b) % 100_000;
-    Some((hi * 100_000 + lo) as i64)
+    Some((parse8(a) * 100_000 + parse8(b)) as i64)
 }
 
 impl Fast {
