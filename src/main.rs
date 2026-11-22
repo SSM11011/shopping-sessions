@@ -873,27 +873,29 @@ fn main() {
             let cap = (n * 2).next_power_of_two().max(16);
             let mask = cap - 1;
             table.clear();
-            table.resize(cap, u64::MAX);
+            table.resize(cap, 0);
             let at = |idx: usize| -> &DkL { unsafe { &*lsegs.get_unchecked(idx >> 9).0.add(idx & 511) } };
             for (si, &(p, len)) in lsegs.iter().enumerate() {
                 let sl = unsafe { std::slice::from_raw_parts(p, len) };
                 for (off, e) in sl.iter().enumerate() {
+                    // slot = 8-bit fingerprint << 24 | (row index + 1); 0 = empty
                     let idx = (si << 9) | off;
                     let h = hash(long_eid_mix(e.pre as u64, e.hi, e.lo));
-                    let fp = (h >> 24) << 24;
+                    let fp = ((h >> 56) as u32) << 24;
+                    let me = fp | (idx as u32 + 1);
                     let mut i = (h as usize >> 3) & mask;
                     loop {
                         let s = unsafe { *table.get_unchecked(i) };
-                        if s == u64::MAX {
-                            table[i] = fp | idx as u64;
+                        if s == 0 {
+                            table[i] = me;
                             break;
                         }
-                        if s & !0xFF_FFFF == fp {
-                            let o = at((s & 0xFF_FFFF) as usize);
+                        if s & 0xFF00_0000 == fp {
+                            let o = at((s & 0xFF_FFFF) as usize - 1);
                             if o.hi == e.hi && o.lo == e.lo && o.pre == e.pre {
                                 if e.ingest < o.ingest {
                                     kill(o.r);
-                                    table[i] = fp | idx as u64;
+                                    table[i] = me;
                                 } else {
                                     kill(e.r);
                                 }
