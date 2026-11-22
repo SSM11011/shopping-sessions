@@ -8,6 +8,8 @@ pub struct Arena {
     base: *mut u8,
     cap: usize,
     used: AtomicUsize,
+    /// end of this arena's huge-page range (0 once switched to normal pages)
+    huge_end: AtomicUsize,
     /// recycled BLOCK-sized blocks (only touched by the arena's own worker thread)
     free: std::cell::UnsafeCell<Vec<*mut u8>>,
 }
@@ -18,43 +20,55 @@ unsafe impl Sync for Arena {}
 
 pub const BLOCK: usize = 16 << 10;
 
-/// Bytes currently free as ready-made >= 2 MB buddy blocks (huge pages obtainable without compaction).
-fn free_huge_bytes() -> Option<u64> {
-    let t = std::fs::read_to_string("/proc/buddyinfo").ok()?;
-    let mut total = 0u64;
-    for l in t.lines() {
-        // "Node 0, zone   Normal  c0 c1 ... c10"
-        let counts: Vec<u64> = l.split_whitespace().skip(4).filter_map(|v| v.parse().ok()).collect();
-        for (order, c) in counts.iter().enumerate() {
-            if order >= 9 {
-                total += c << (order + 12);
+static THP_BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Decide how many bytes of each worker arena ask for transparent huge pages. Huge pages are a big win
+/// when they come cheap (clean memory: ~2x on the parse), but with defrag=madvise a huge-page fault on a
+/// fragmented machine can stall in direct compaction. So instead of an all-or-nothing switch (which
+/// flips between runs near the threshold), each arena gets huge pages for its share of the memory that
+/// is *already free* in >= 2 MB blocks (with headroom), and normal pages beyond that.
+/// SESSIONS_THP=0/1 forces none/all.
+pub fn decide_thp(threads: usize) -> u64 {
+    let _ = threads;
+    *THP_BUDGET.get_or_init(|| {
+        let per = match std::env::var("SESSIONS_THP").ok().as_deref() {
+            Some("0") => 0,
+            _ => u64::MAX,
+        };
+        if per > 0 {
+            if let Some((a, f)) = thp_counters() {
+                THP_BASE_ALLOC.store(a as usize, Relaxed);
+                THP_BASE_FALLBACK.store(f as usize, Relaxed);
             }
         }
-    }
-    Some(total)
-}
-
-static THP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-
-/// Decide once whether arenas ask for transparent huge pages. With defrag=madvise, a huge-page fault on
-/// a fragmented machine stalls in direct compaction (costs more than it saves), so THP is used only when
-/// enough memory is already free in >= 2 MB blocks to cover `need` bytes. SESSIONS_THP=0/1 overrides.
-pub fn decide_thp(need: u64) -> bool {
-    *THP.get_or_init(|| {
-        let v = match std::env::var("SESSIONS_THP").ok().as_deref() {
-            Some("0") => false,
-            Some("1") => true,
-            _ => free_huge_bytes().is_none_or(|f| f >= need),
-        };
-        if std::env::var_os("SESSIONS_QUIET").is_none() {
-            eprintln!("thp: free-huge {:?} MB, need {} MB -> {}", free_huge_bytes().map(|f| f >> 20), need >> 20, v);
-        }
-        v
+        per
     })
 }
 
-fn use_thp() -> bool {
-    *THP.get().unwrap_or(&true)
+/// (thp_fault_fallback, compact_stall) from /proc/vmstat: huge-page faults that fell back to 4 KB pages,
+/// and direct-compaction stalls (allocations that had to stop and migrate pages to build a 2 MB block).
+fn thp_counters() -> Option<(u64, u64)> {
+    let t = std::fs::read_to_string("/proc/vmstat").ok()?;
+    let mut a = None;
+    let mut f = None;
+    for l in t.lines() {
+        if let Some(v) = l.strip_prefix("thp_fault_fallback ") {
+            a = v.trim().parse().ok();
+        } else if let Some(v) = l.strip_prefix("compact_stall ") {
+            f = v.trim().parse().ok();
+        }
+    }
+    Some((a?, f?))
+}
+
+static THP_BASE_ALLOC: AtomicUsize = AtomicUsize::new(0);
+static THP_BASE_FALLBACK: AtomicUsize = AtomicUsize::new(0);
+static THP_PROBES: AtomicUsize = AtomicUsize::new(0);
+/// set once huge pages are judged not worth it on this machine (they mostly fall back)
+static THP_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn thp_budget() -> u64 {
+    *THP_BUDGET.get().unwrap_or(&u64::MAX)
 }
 
 impl Arena {
@@ -69,13 +83,13 @@ impl Arena {
                 -1,
                 0,
             );
-            if p == libc::MAP_FAILED {
-                return Arena { base: std::ptr::null_mut(), cap: 0, used: AtomicUsize::new(0), free: Default::default() };
+            // payload rows are addressed relative to the arena base, so a missing arena is fatal
+            assert!(p != libc::MAP_FAILED, "arena reservation failed");
+            let huge = (thp_budget().min(cap as u64)) as usize;
+            if huge > 0 {
+                libc::madvise(p, huge, libc::MADV_HUGEPAGE);
             }
-            if use_thp() {
-                libc::madvise(p, cap, libc::MADV_HUGEPAGE);
-            }
-            Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), free: Default::default() }
+            Arena { base: p as *mut u8, cap, used: AtomicUsize::new(0), huge_end: AtomicUsize::new(huge), free: Default::default() }
         }
     }
 
@@ -86,6 +100,37 @@ impl Arena {
         if bytes > 0 && !self.base.is_null() {
             unsafe {
                 libc::madvise(self.base as *mut libc::c_void, bytes, 23 /* MADV_POPULATE_WRITE */);
+            }
+        }
+    }
+
+    /// At the first block of each new 2 MB page in the huge-page range. After the first 16 and 64 such
+    /// pages (all arenas together), look at the kernel counters since start: on a fragmented machine
+    /// huge-page faults trigger direct compaction (compact_stall climbs, often with fallbacks), which
+    /// costs far more than huge pages save, so every arena switches to normal pages. On a machine with
+    /// free 2 MB blocks neither counter moves and huge pages stay on.
+    #[cold]
+    fn probe_huge(&self, _p: *mut u8, at: usize) {
+        if !THP_OFF.load(Relaxed) {
+            let n = THP_PROBES.fetch_add(1, Relaxed) + 1;
+            if n == 16 || n == 64 {
+                if let Some((fb, cs)) = thp_counters() {
+                    let dfb = fb.saturating_sub(THP_BASE_ALLOC.load(Relaxed) as u64);
+                    let dcs = cs.saturating_sub(THP_BASE_FALLBACK.load(Relaxed) as u64);
+                    if dcs >= 8 || dfb >= 8 {
+                        THP_OFF.store(true, Relaxed);
+                    }
+                    if std::env::var_os("SESSIONS_QUIET").is_none() {
+                        eprintln!("thp check @{n}: fallback +{dfb} compact_stall +{dcs} -> {}", if THP_OFF.load(Relaxed) { "off" } else { "on" });
+                    }
+                }
+            }
+        }
+        if THP_OFF.load(Relaxed) {
+            let from = at;
+            let end = self.huge_end.swap(0, Relaxed);
+            if end > from {
+                unsafe { libc::madvise(self.base.add(from) as *mut libc::c_void, end - from, libc::MADV_NOHUGEPAGE) };
             }
         }
     }
@@ -104,7 +149,11 @@ impl Arena {
         let at = (self.used.load(Relaxed) + BLOCK - 1) & !(BLOCK - 1);
         if at + BLOCK <= self.cap {
             self.used.store(at + BLOCK, Relaxed);
-            unsafe { self.base.add(at) }
+            let p = unsafe { self.base.add(at) };
+            if at & ((2 << 20) - 1) == 0 && at < self.huge_end.load(Relaxed) {
+                self.probe_huge(p, at);
+            }
+            p
         } else {
             let layout = std::alloc::Layout::from_size_align(BLOCK, BLOCK).unwrap();
             unsafe { std::alloc::alloc(layout) }

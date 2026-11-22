@@ -507,7 +507,7 @@ fn main() {
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
     // a 32-bit ref = worker << 28 | (offset / 16)
     let _ = arena_bytes;
-    arena::decide_thp(((est_rows * 32 + est_clicks * 24) * 3 / 2 + (256 << 20)) as u64);
+    arena::decide_thp(threads);
     let arenas: Vec<Arena> = (0..threads).map(|_| Arena::new((4usize << 30) - (2 << 20))).collect();
 
 
