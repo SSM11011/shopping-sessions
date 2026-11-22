@@ -415,7 +415,12 @@ fn cpu_secs() -> (f64, f64) {
 fn timing(t0: Instant, what: &str) {
     if std::env::var_os("SESSIONS_QUIET").is_none() {
         let (u, s) = cpu_secs();
-        eprintln!("{what:>9} {:>7.1} ms  cpu u {u:6.2} s {s:5.2}", t0.elapsed().as_secs_f64() * 1e3);
+        let flt = unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            ru.ru_minflt
+        };
+        eprintln!("{what:>9} {:>7.1} ms  cpu u {u:6.2} s {s:5.2}  minflt {flt}", t0.elapsed().as_secs_f64() * 1e3);
     }
 }
 
@@ -535,6 +540,7 @@ fn main() {
     // ~0.8M at 20M events (est_clicks 6.8M); this sizes for ~1.5x that at load <= 2/3, and a full probe
     // window still falls back to the general interner.
     keys::init_long((est_clicks + lk_bytes / 20 + est_rows / 16) / 8);
+    run_parallel(threads, threads, |_, t| keys::touch_long(t, threads));
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     arena::decide_thp(threads);
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by

@@ -31,7 +31,7 @@ struct Slot {
 
 struct Long {
     mask: usize,
-    slots: Vec<Slot>,
+    slots: std::mem::ManuallyDrop<Vec<Slot>>,
 }
 
 static LONG_TABLE: OnceLock<Long> = OnceLock::new();
@@ -40,12 +40,25 @@ static LONG_TABLE: OnceLock<Long> = OnceLock::new();
 /// any key is made; without it long IDs use the general interner.
 pub fn init_long(expected: usize) {
     let cap = (expected * 3 / 2 + 1024).next_power_of_two();
-    // zeroed pages straight from the allocator (fresh mmap): no fill pass; all-zero = empty slot
+    // fresh anonymous mapping: zero pages (all-zero = empty slot), no fill pass. Huge pages: 4 KB
+    // first-touch faults from 8 threads at random slots contend on the mm lock (0.3 s sys at 20M).
+    const HUGE: usize = 2 << 20;
+    let bytes = (cap * std::mem::size_of::<Slot>() + HUGE - 1) & !(HUGE - 1);
     let slots = unsafe {
-        let layout = std::alloc::Layout::array::<Slot>(cap).unwrap();
-        let p = std::alloc::alloc_zeroed(layout) as *mut Slot;
-        assert!(!p.is_null(), "long-id table allocation failed");
-        Vec::from_raw_parts(p, cap, cap)
+        // over-map by 2 MB and start at a 2 MB boundary so every page of the table can be huge
+        let raw = libc::mmap(
+            std::ptr::null_mut(),
+            bytes + HUGE,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
+            -1,
+            0,
+        );
+        assert!(raw != libc::MAP_FAILED, "long-id table allocation failed");
+        let p = ((raw as usize + HUGE - 1) & !(HUGE - 1)) as *mut libc::c_void;
+        libc::madvise(p, bytes, libc::MADV_HUGEPAGE);
+        // never freed: the table lives until exit (ManuallyDrop keeps Vec from freeing mmap memory)
+        std::mem::ManuallyDrop::new(Vec::from_raw_parts(p as *mut Slot, cap, cap))
     };
     let _ = LONG_TABLE.set(Long { mask: cap - 1, slots });
 }
@@ -54,6 +67,20 @@ pub fn init_long(expected: usize) {
 pub fn long_stats() -> (usize, usize, usize) {
     let (f, c) = LONG_TABLE.get().map_or((0, 0), |t| (t.slots.iter().filter(|s| s.hi.load(Relaxed) != 0).count(), t.mask + 1));
     (f, c, interner().lock().unwrap().strs.len())
+}
+
+/// Write-touches part `t` of `n` of the table (call for every t, before any lookup). Lookups read a
+/// slot before writing it; a read fault maps the zero page, after which the write fault installs 4 KB
+/// pages (12k faults at 20M) instead of 2 MB ones. Writing first gets huge pages.
+pub fn touch_long(t: usize, n: usize) {
+    let Some(tb) = LONG_TABLE.get() else { return };
+    const HUGE: usize = 2 << 20;
+    let base = tb.slots.as_ptr() as *mut u8;
+    let bytes = tb.slots.len() * std::mem::size_of::<Slot>();
+    let chunks = bytes.div_ceil(HUGE);
+    for c in (t * chunks / n)..((t + 1) * chunks / n) {
+        unsafe { std::ptr::write_volatile(base.add(c * HUGE), 0) };
+    }
 }
 
 #[inline(always)]
