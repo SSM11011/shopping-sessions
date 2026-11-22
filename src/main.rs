@@ -799,7 +799,7 @@ fn main() {
     };
     struct Stage2 {
         segs: Vec<(*const Dk, usize)>,
-        table: Vec<u64>,
+        table: Vec<u32>,
     }
     unsafe impl Send for Stage2 {}
     let st2: Vec<Mutex<Stage2>> =
@@ -807,19 +807,20 @@ fn main() {
     run_parallel(threads, nparts, |w, t| {
         let mut g = st2[w].lock().unwrap();
         let st = &mut *g;
-        // keys stay where parsing put them (index = segment << 10 | offset); slot = 40-bit fingerprint
-        // << 24 | index, so a different event in a slot is rejected without reading its key
+        // keys stay where parsing put them (index = segment << 10 | offset); slot = 8-bit fingerprint << 24 |
+        // (index + 1), 0 = empty: 4-byte slots keep the table half the size (cache-resident at 60M), and a
+        // different event in a slot is still rejected without reading its key 255 times in 256
         let mut segs: Vec<(*const Dk, usize)> = std::mem::take(&mut st.segs);
         segs.clear();
         for src in &dk_in {
             src.for_each_slice(t, |sl| segs.push((sl.as_ptr(), sl.len())));
         }
-        assert!(segs.len() < (1 << 14), "dedup partition too large for 24-bit row index");
+        assert!(segs.len() < (1 << 14) - 1, "dedup partition too large for 24-bit row index");
         let n: usize = segs.iter().map(|x| x.1).sum();
         let cap = (n * 2).next_power_of_two().max(16);
         let mask = cap - 1;
         st.table.clear();
-        st.table.resize(cap, u64::MAX);
+        st.table.resize(cap, 0);
         let table = &mut st.table;
         let at = |idx: usize| -> &Dk { unsafe { &*segs.get_unchecked(idx >> 10).0.add(idx & 1023) } };
         const DPF: usize = 8;
@@ -835,20 +836,21 @@ fn main() {
                 }
                 let idx = (si << 10) | off;
                 let h = hash(e.eid);
-                let fp = (h >> 24) << 24;
+                let fp = ((h >> 56) as u32) << 24;
+                let me = fp | (idx as u32 + 1);
                 let mut i = (h as usize >> 3) & mask;
                 loop {
                     let s = unsafe { *table.get_unchecked(i) };
-                    if s == u64::MAX {
-                        table[i] = fp | idx as u64;
+                    if s == 0 {
+                        table[i] = me;
                         break;
                     }
-                    if s & !0xFF_FFFF == fp {
-                        let o = at((s & 0xFF_FFFF) as usize);
+                    if s & 0xFF00_0000 == fp {
+                        let o = at((s & 0xFF_FFFF) as usize - 1);
                         if o.eid == e.eid {
                             if e.ingest < o.ingest {
                                 kill(o.r);
-                                table[i] = fp | idx as u64;
+                                table[i] = me;
                             } else {
                                 kill(e.r);
                             }
