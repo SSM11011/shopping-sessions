@@ -478,6 +478,7 @@ fn main() {
     let mut tasks: Vec<Task> = Vec::new();
     let mut ev_bytes = 0usize;
     let mut ck_bytes = 0usize;
+    let mut lk_bytes = 0usize;
     for (kind, dir) in [(Kind::Event, "events"), (Kind::Link, "links"), (Kind::Click, "clicks")] {
         for p in list_csv(&data.join(dir)) {
             let f = File::open(&p).expect("open");
@@ -493,6 +494,9 @@ fn main() {
             if kind == Kind::Click {
                 ck_bytes += len;
             }
+            if kind == Kind::Link {
+                lk_bytes += len;
+            }
             let mut s = 0;
             while s < len {
                 let e = (s + chunk).min(len);
@@ -502,7 +506,7 @@ fn main() {
         }
     }
     let est_rows = ev_bytes / 78 + 1;
-    let nparts = std::env::var("SESSIONS_PARTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (est_rows / 48_000).next_power_of_two().clamp(16, 4096));
+    let nparts = std::env::var("SESSIONS_PARTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or_else(|| (est_rows / 48_000).next_power_of_two().clamp(16, 512));
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
@@ -522,7 +526,9 @@ fn main() {
                 dk: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
                 pe: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
                 ck: Parts::new(nparts, est_clicks * 5 / 4 / nparts / threads),
-                links: Vec::new(),
+                // link rows are >= 4 bytes but ~21 in practice; a generous one-shot capacity avoids the
+                // realloc ladder (untouched capacity is never faulted in)
+                links: Vec::with_capacity(lk_bytes / 12 / threads * 2 + 1024),
                 tsf: ts::Fast::default(),
             })
         })
@@ -804,6 +810,7 @@ fn main() {
     let mut order: Vec<(usize, usize)> =
         (0..nparts).map(|t| (pe_src.iter().map(|s| s.len(t)).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
+    let bbits: u32 = std::env::var("SESSIONS_BBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(14);
     let ud_dir = outdir.join("user_daily");
     std::fs::create_dir_all(&ud_dir).expect("mkdir");
     run_parallel_fin(threads, nparts, |w, t| {
@@ -817,7 +824,7 @@ fn main() {
         // bucket by the next hash bits below the partition bits: persons almost never share a bucket,
         // so each bucket needs only a tiny sort by (person, ts)
         let n_ev: usize = pe_src.iter().map(|s| s.len(t)).sum();
-        let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(12);
+        let bits = ((n_ev / 8).max(16).next_power_of_two().trailing_zeros()).min(bbits);
         let sh = pshift - bits;
         let bmask = (1usize << bits) - 1;
         let bucket = |k: u64| (phash(k) >> sh) as usize & bmask;
@@ -829,8 +836,10 @@ fn main() {
                 continue;
             }
             // already in ts order within the bucket; group persons if several share it (stable)
+            // (person, ts) sort: equal pairs are interchangeable (their input order is arbitrary anyway),
+            // so an unstable sort gives the same result as the stable one, without its scratch allocation
             if ev.len() > 1 && ev.iter().any(|e| e.person != ev[0].person) {
-                ev.sort_by_key(|e| e.person);
+                ev.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
             }
             let ck = &mut cks[cb[b] as usize..cb[b + 1] as usize];
             if ck.len() > 1 {
