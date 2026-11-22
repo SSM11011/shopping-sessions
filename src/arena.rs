@@ -31,8 +31,13 @@ static THP_BUDGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 pub fn decide_thp(threads: usize) -> u64 {
     let _ = threads;
     *THP_BUDGET.get_or_init(|| {
+        // THP disabled system-wide: MADV_HUGEPAGE would silently do nothing and leave the arenas on
+        // single 4 KB faults; treat it as "no huge pages" so they are populated in bulk instead
+        let never = std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled")
+            .is_ok_and(|s| s.contains("[never]"));
         let per = match std::env::var("SESSIONS_THP").ok().as_deref() {
             Some("0") => 0,
+            _ if never => 0,
             _ => u64::MAX,
         };
         if per > 0 {
