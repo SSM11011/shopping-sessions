@@ -70,6 +70,10 @@ def main():
             f.write(f"{c},{rnd.choice(['search', 'social', 'email', 'Organic'])}\n")
 
     base_ids = [f"u{i}" for i in range(rnd.randint(5, 60))]
+    # v5: 1 in 8 IDs are a letter + 32 lowercase hex digits; near-misses go to the general interner
+    for _ in range(rnd.randint(0, 12)):
+        h = "".join(rnd.choice("0123456789abcdef") for _ in range(32))
+        base_ids.append(rnd.choice(["u", "u", "a", "z"]) + rnd.choice([h, h, h, h[:31], h + "0", h.upper(), "0" * 32, "f" * 32]))
     exotic = ["U1", " u1", "u1 ", "u\t2", "ü3", "averyveryverylongid_1234567890", "u_9", "A", "0", "zzzzzzzzzzz",
               "UU", "u1\r", "user_id"]
     ids = base_ids + rnd.sample(exotic, rnd.randint(0, len(exotic)))
@@ -136,6 +140,8 @@ def main():
         for _ in range(rnd.randint(1, 6)):
             eid += 1
             e = rnd.choice([f"e{eid}", f"e{eid}", f"E{eid}", f"e{eid} "]) if rnd.random() < 0.05 else f"e{eid}"
+            if rnd.random() < 0.15:
+                e = "e" + format((eid * 0x9E3779B97F4A7C15 + seed) % (1 << 128), "032x")
             typ = rnd.choice(["view"] * 6 + ["cart"] * 2 + ["purchase"] * 3 + ["Purchase", "view ", ""])
             prod = rnd.choice(prods + ["p99", "", "P1"])
             price = rnd.choice(["", "100", "0250", "19.99", "-5", "0", "10000000", "10000001", "00", "٢٥٠",
@@ -165,7 +171,7 @@ def main():
         u = rnd.choice(ids)
         t = ws + rnd.randrange(-8 * DAY, 14 * DAY + DAY)
         t -= t % rnd.choice([1, 1000])
-        cid = rnd.choice([f"k{k}", f"k{k}", f"K{k}", f"k{k:03d}", f"k_{k}"])
+        cid = rnd.choice([f"k{k}", f"k{k}", f"K{k}", f"k{k:03d}", f"k_{k}", "k" + format(((k * 0xD1B54A32D192ED03 + seed) % (1 << 127)) | (1 << 127), "032x"), "k" + format(k, "032x")])  # disjoint: top bit set / clear (a click_id names one click)
         row = [cid, u if rnd.random() > 0.03 else "", rnd.choice(camps + ["c_999", "C_1"]),
                iso(t, rnd) if rnd.random() > 0.05 else bad_ts(t, rnd)]
         clicks.append(line(row))
