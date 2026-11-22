@@ -96,14 +96,15 @@ pub fn parse(s: &[u8]) -> Option<i64> {
 /// Per-thread cache of validated calendar dates (`YYYY-MM-DD` bytes -> days since epoch). A window spans
 /// only a few dozen distinct dates, so after warm-up the date part costs one compare.
 pub struct Fast {
-    k8: [u64; 64],
-    k2: [u16; 64],
-    days: [i64; 64],
+    k8: [u64; 128],
+    k2: [u16; 128],
+    days: [i64; 128],
 }
 
 impl Default for Fast {
     fn default() -> Self {
-        Fast { k8: [u64::MAX; 64], k2: [0; 64], days: [0; 64] }
+        // every slot starts as the valid pair 1970-01-01 -> 0, so a hit is always a correct answer
+        Fast { k8: [u64::from_le_bytes(*b"1970-01-"); 128], k2: [u16::from_le_bytes(*b"01"); 128], days: [0; 128] }
     }
 }
 
@@ -168,7 +169,9 @@ impl Fast {
     fn date(&mut self, s: &[u8]) -> Option<i64> {
         let k8 = le64(s, 0);
         let k2 = u16::from_le_bytes([s[8], s[9]]);
-        let h = ((k8 ^ (k2 as u64).wrapping_mul(0x9E37_79B9)).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize;
+        // direct index: day-of-month digits (2 + 4 low bits) and the month's parity; any two adjacent
+        // months differ in parity, so a window's dates never collide
+        let h = (((k2 & 3) | ((k2 >> 6) & 0x3C)) as usize) | ((k8 >> 42) & 0x40) as usize;
         if self.k8[h] == k8 && self.k2[h] == k2 {
             return Some(self.days[h]);
         }
