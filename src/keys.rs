@@ -145,9 +145,12 @@ pub unsafe fn click_padded(s: &[u8], w: usize, store: &mut Vec<[u64; 2]>) -> u64
         return k;
     }
     if let Some((p, hi, lo)) = parse_long(s) {
-        let k = EXOTIC | LONG | LV | ((p - b'a') as u64) << 56 | (w as u64) << 48 | store.len() as u64;
-        store.push([hi, lo]);
-        return k;
+        if w < 256 {
+            let k = EXOTIC | LONG | LV | ((p - b'a') as u64) << 56 | (w as u64) << 48 | store.len() as u64;
+            store.push([hi, lo]);
+            return k;
+        }
+        return exotic_key(s);
     }
     intern(s)
 }
