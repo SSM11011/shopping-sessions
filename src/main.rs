@@ -912,8 +912,9 @@ fn main() {
     let ws_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1) as usize;
     let ncol = n_camp + 1; // + organic
-    let results: Vec<Mutex<WorkerOut>> =
-        (0..threads).map(|_| Mutex::new(WorkerOut::new(ncol * ndays, n_camp, (est_rows / 8 / threads + 1024).min(2 * FLUSH_ROWS)))).collect();
+    // each worker builds its own output state on its first task (in parallel, first-touched where used)
+    let results: Vec<Mutex<Option<WorkerOut>>> = (0..threads).map(|_| Mutex::new(None)).collect();
+    let new_wo = || WorkerOut::new(ncol * ndays, n_camp, (est_rows / 8 / threads + 1024).min(2 * FLUSH_ROWS));
     let mut order: Vec<(usize, usize)> =
         (0..nparts).map(|t| (pe_src.iter().map(|s| s.len(t)).sum::<usize>(), t)).collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
@@ -923,7 +924,7 @@ fn main() {
     run_parallel_fin(threads, nparts, |w, t| {
         let t = order[t].1;
         let mut wo = results[w].lock().unwrap();
-        let wo = &mut *wo;
+        let wo = wo.get_or_insert_with(new_wo);
         let mut evs = std::mem::take(&mut wo.evs);
         let mut cks = std::mem::take(&mut wo.cks);
         let mut eb = std::mem::take(&mut wo.eb);
@@ -1005,13 +1006,14 @@ fn main() {
     }, |w| {
         // this worker is done: write what is left (worker 0 always writes, so the folder is never empty)
         let mut wo = results[w].lock().unwrap();
+        let wo = wo.get_or_insert_with(new_wo);
         if !wo.day.is_empty() || (w == 0 && wo.files == 0) {
             let k = wo.files;
             out::write_user(&ud_dir.join(format!("part-{w:03}-{k:04}.parquet")), &wo, &cat_names);
             wo.files += 1;
         }
     });
-    let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap()).collect();
+    let results: Vec<WorkerOut> = results.into_iter().map(|m| m.into_inner().unwrap().expect("worker output")).collect();
     timing(t0, "sessions");
     // ---- outputs: campaign_daily is written by one worker while the others free the arenas (left to
     // process exit, the kernel frees them on one core: ~40 ms on 20M events with 4 KB pages)
