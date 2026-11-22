@@ -131,36 +131,15 @@ impl LinkMap {
         let cap_in = uf.cap();
         let per = 1 << 16;
         let ntask = cap_in.div_ceil(per);
-        // pass 1: resolve every slot once (name, or EMPTY for empty slots and roots), count non-roots
-        let mut names: Vec<u64> = Vec::with_capacity(cap_in);
-        let np = SendPtr(names.as_mut_ptr());
-        let counts: Vec<AtomicU64> = (0..ntask).map(|_| AtomicU64::new(0)).collect();
-        par(ntask, &|t| {
-            let np = &np;
-            let mut c = 0;
-            for i in t * per..((t + 1) * per).min(cap_in) {
-                let v = match uf.resolved(i) {
-                    Some((k, name)) if k != name => {
-                        c += 1;
-                        name
-                    }
-                    _ => EMPTY,
-                };
-                unsafe { *np.0.add(i) = v };
-            }
-            counts[t].store(c, Relaxed);
-        });
-        unsafe { names.set_len(cap_in) };
-        let n: usize = counts.iter().map(|c| c.load(Relaxed) as usize).sum();
-        let cap = (n * 2 + 1).next_power_of_two().max(64);
-        let bwords = (n * 10 / 64 + 1).next_power_of_two().max(64);
+        // non-roots <= IDs <= cap_in / 2: a table of cap_in slots keeps the load <= 1/2, so no counting pass
+        let cap = cap_in.max(64);
+        let bwords = (cap * 5 / 64 + 1).next_power_of_two().max(64);
         let mask = cap - 1;
         let bmask = bwords - 1;
         let mut slots: Vec<(u64, u64)> = Vec::with_capacity(cap);
         let mut bloom: Vec<u64> = Vec::with_capacity(bwords);
         let sp = SendPtr(slots.as_mut_ptr());
         let bp = SendPtr(bloom.as_mut_ptr());
-        // parallel init (also spreads the page faults over threads)
         let ip = 1 << 16;
         par(cap.div_ceil(ip), &|t| {
             let sp = &sp;
@@ -178,26 +157,15 @@ impl LinkMap {
             slots.set_len(cap);
             bloom.set_len(bwords);
         }
-        // pass 2: insert non-roots (CAS on the key word, plain store of the value)
+        // one pass: resolve each ID and insert the non-roots (CAS on the key word)
         par(ntask, &|t| {
             let (sp, bp) = (&sp, &bp);
             let hi = ((t + 1) * per).min(cap_in);
             for i in t * per..hi {
-                // prefetch the insert target of a non-root a few slots ahead
-                if i + 16 < hi && names[i + 16] != EMPTY {
-                    let hk = hash(uf.keys[i + 16].load(Relaxed));
-                    #[cfg(target_arch = "x86_64")]
-                    unsafe {
-                        use std::arch::x86_64::*;
-                        _mm_prefetch(sp.0.add(hk as usize & mask) as *const i8, _MM_HINT_ET0);
-                        _mm_prefetch(bp.0.add((hk >> 40) as usize & bmask) as *const i8, _MM_HINT_ET0);
-                    }
-                }
-                let name = names[i];
-                if name == EMPTY {
+                let Some((k, name)) = uf.resolved(i) else { continue };
+                if k == name {
                     continue;
                 }
-                let k = uf.keys[i].load(Relaxed);
                 let h = hash(k);
                 unsafe {
                     AtomicU64::from_ptr(bp.0.add((h >> 40) as usize & bmask)).fetch_or(bloom_bits(h), Relaxed);
@@ -216,7 +184,6 @@ impl LinkMap {
         LinkMap { mask, slots, bloom, bmask }
     }
 
-    /// Prefetch by precomputed hash (see `person_h`).
     #[inline(always)]
     pub fn prefetch_bloom(&self, h: u64) {
         #[cfg(target_arch = "x86_64")]
