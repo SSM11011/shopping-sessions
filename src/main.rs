@@ -25,11 +25,13 @@ const WEEK: i64 = 7 * DAY;
 const GAP: u32 = 1_800_000;
 const NO_TS: u32 = u32::MAX;
 
-/// Event candidate: kept for dedup even when invalid (ts == NO_TS). 28 bytes.
+/// Event candidate: kept for dedup even when invalid (ts == NO_TS). A long hex event_id is carried by
+/// value: eid = keys::LONG_EID | prefix, with its 128 bits in ehi/elo.
 #[derive(Clone, Copy)]
-#[repr(C, align(32))]
 struct Ev {
     eid: u64,
+    ehi: u64,
+    elo: u64,
     user: u64,
     ingest: u32,
     ts: u32,
@@ -44,6 +46,23 @@ struct Dk {
     eid: u64,
     ingest: u32,
     r: u32,
+}
+
+/// Dedup key of a line with a long hex event_id (exact 128-bit value + prefix). 32 bytes.
+#[derive(Clone, Copy)]
+#[repr(C, align(32))]
+struct DkL {
+    hi: u64,
+    lo: u64,
+    pre: u32,
+    ingest: u32,
+    r: u32,
+}
+
+/// Partition of a long event_id (same partition count as the short keys, its own lists).
+#[inline(always)]
+fn long_eid_mix(pre: u64, hi: u64, lo: u64) -> u64 {
+    hi ^ lo.rotate_left(23) ^ pre.wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
 const NO_REF: u32 = u32::MAX;
@@ -376,6 +395,8 @@ struct ParseOut {
     buf: Vec<u8>,
     /// dedup keys, by event_id partition
     dk: Parts<Dk>,
+    /// dedup keys of long hex event_ids, by their own hash partition
+    dkl: Parts<DkL>,
     /// payload rows, by person partition
     pe: Parts<Pe>,
     ck: Parts<Ck>,
@@ -510,8 +531,10 @@ fn main() {
     let pshift = 64 - nparts.trailing_zeros();
     let part_of = |k: u64| (phash(k) >> pshift) as usize;
     let est_clicks = ck_bytes / 40 + 1;
-    // long hex IDs (1 in 8 distinct IDs of each kind): sized for 1 in 6 of every event, click and link ID
-    keys::init_long((est_rows + est_clicks + lk_bytes / 10) / 6);
+    // long hex user/click/link IDs (1 in 8 distinct IDs; event_ids never enter this table). Measured
+    // ~0.8M at 20M events (est_clicks 6.8M); this sizes for ~1.5x that at load <= 2/3, and a full probe
+    // window still falls back to the general interner.
+    keys::init_long((est_clicks + lk_bytes / 20 + est_rows / 16) / 8);
     let arena_bytes = (est_rows * (32 + 24) + est_clicks * 48) / threads * 5 / 4 + 3 * nparts * BLOCK + (256 << 20);
     arena::decide_thp(threads);
     // 4 GB of address space per worker (only touched pages cost memory): payload rows are addressed by
@@ -530,6 +553,7 @@ fn main() {
             Mutex::new(ParseOut {
                 buf: Vec::new(),
                 dk: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
+                dkl: Parts::new(nparts, est_rows / 4 / nparts / threads),
                 pe: Parts::new(nparts, est_rows * 5 / 4 / nparts / threads),
                 ck: Parts::new(nparts, est_clicks * 5 / 4 / nparts / threads),
                 // link rows are >= 4 bytes but ~21 in practice; a generous one-shot capacity avoids the
@@ -628,7 +652,7 @@ fn main() {
         let buf: &[u8] = &own;
         match task.kind {
             Kind::Event => {
-                let mut ring = [Ev { eid: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
+                let mut ring = [Ev { eid: 0, ehi: 0, elo: 0, user: 0, ingest: 0, ts: 0, pc: 0 }; R];
                 let mut rh = [0u64; R];
                 let mut rn = 0usize;
                 let base = arena.base() as usize;
@@ -647,12 +671,23 @@ fn main() {
                 ) {
                     let p = o.pe.push_ptr(arena, (phash(person) >> pshift) as usize, Pe { person, ts: ev.ts, pc: ev.pc });
                     let r = wref | ((p as usize - base) >> 4) as u32;
-                    o.dk.push(arena, (phash(ev.eid) >> pshift) as usize, Dk { eid: ev.eid, ingest: ev.ingest, r });
+                    push_dk(o, arena, pshift, &ev, r);
+                }
+                /// The event's dedup key: short/interned ids to `dk`, long hex ids by value to `dkl`.
+                #[inline(always)]
+                fn push_dk(o: &mut ParseOut, arena: &Arena, pshift: u32, ev: &Ev, r: u32) {
+                    if ev.eid & keys::LONG_EID == keys::LONG_EID {
+                        let pre = ev.eid & 0xFF;
+                        let part = (phash(long_eid_mix(pre, ev.ehi, ev.elo)) >> pshift) as usize;
+                        o.dkl.push(arena, part, DkL { hi: ev.ehi, lo: ev.elo, pre: pre as u32, ingest: ev.ingest, r });
+                    } else {
+                        o.dk.push(arena, (phash(ev.eid) >> pshift) as usize, Dk { eid: ev.eid, ingest: ev.ingest, r });
+                    }
                 }
                 scan::lines::<7>(&buf, start, end, #[inline(always)] |f| {
                     if let Some(ev) = parse_event(&ctx, &mut o.tsf, f, ing_base) {
                         if ev.ts == NO_TS {
-                            o.dk.push(arena, part_of(ev.eid), Dk { eid: ev.eid, ingest: ev.ingest, r: NO_REF });
+                            push_dk(o, arena, pshift, &ev, NO_REF);
                             return;
                         }
                         let h = hash(ev.user);
@@ -732,6 +767,7 @@ fn main() {
     // an invalid winner simply has no payload. Unique events (the vast majority) write nothing.
     let ck_parts: Vec<Parts<Ck>> = outs.iter_mut().map(|o| std::mem::take(&mut o.ck)).collect();
     let dk_in: Vec<Parts<Dk>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dk)).collect();
+    let dkl_in: Vec<Parts<DkL>> = outs.iter_mut().map(|o| std::mem::take(&mut o.dkl)).collect();
     let pe_src: Vec<Parts<Pe>> = outs.into_iter().map(|o| o.pe).collect();
     let bases: Vec<usize> = arenas.iter().map(|a| a.base() as usize).collect();
     let kill = |r: u32| {
@@ -803,8 +839,52 @@ fn main() {
             }
         }
         st.segs = segs;
+        // long hex event_ids of this partition: same scheme over exact (prefix, hi, lo)
+        let mut lsegs: Vec<(*const DkL, usize)> = Vec::new();
+        for src in &dkl_in {
+            src.for_each_slice(t, |sl| lsegs.push((sl.as_ptr(), sl.len())));
+        }
+        let n: usize = lsegs.iter().map(|x| x.1).sum();
+        if n > 0 {
+            assert!(lsegs.len() < (1 << 14), "dedup partition too large for 24-bit row index");
+            let cap = (n * 2).next_power_of_two().max(16);
+            let mask = cap - 1;
+            table.clear();
+            table.resize(cap, u64::MAX);
+            let at = |idx: usize| -> &DkL { unsafe { &*lsegs.get_unchecked(idx >> 9).0.add(idx & 511) } };
+            for (si, &(p, len)) in lsegs.iter().enumerate() {
+                let sl = unsafe { std::slice::from_raw_parts(p, len) };
+                for (off, e) in sl.iter().enumerate() {
+                    let idx = (si << 9) | off;
+                    let h = hash(long_eid_mix(e.pre as u64, e.hi, e.lo));
+                    let fp = (h >> 24) << 24;
+                    let mut i = (h as usize >> 3) & mask;
+                    loop {
+                        let s = unsafe { *table.get_unchecked(i) };
+                        if s == u64::MAX {
+                            table[i] = fp | idx as u64;
+                            break;
+                        }
+                        if s & !0xFF_FFFF == fp {
+                            let o = at((s & 0xFF_FFFF) as usize);
+                            if o.hi == e.hi && o.lo == e.lo && o.pre == e.pre {
+                                if e.ingest < o.ingest {
+                                    kill(o.r);
+                                    table[i] = fp | idx as u64;
+                                } else {
+                                    kill(e.r);
+                                }
+                                break;
+                            }
+                        }
+                        i = (i + 1) & mask;
+                    }
+                }
+            }
+        }
     });
     drop(dk_in);
+    drop(dkl_in);
     timing(t0, "dedup");
 
     // ---- sessions per person-partition
@@ -927,6 +1007,10 @@ fn main() {
     }
     out::write_all(&outdir, &results, &camp_acc, &camp_ids, &channels, &cat_names, ws_day, ndays, threads);
     timing(t0, "total");
+    if std::env::var_os("SESSIONS_IDSTATS").is_some() {
+        let (f, c, g) = keys::long_stats();
+        eprintln!("long-id table {f} / {c} slots; general interner {g} strings; est_rows {est_rows} est_clicks {est_clicks} lk_bytes {lk_bytes}");
+    }
     prof::dump();
     std::process::exit(0);
 }
@@ -1065,7 +1149,7 @@ fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> 
     if f[0].is_empty() {
         return None;
     }
-    let eid = unsafe { keys::key_padded(f[0]) };
+    let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) };
     let (ingest, ing32) = match tsf.parse(f[3]) {
         Some(v) => {
             // seconds since ing_base (normal case: v > 0, small offset); exact floor division otherwise
@@ -1075,7 +1159,7 @@ fn parse_event(ctx: &Ctx, tsf: &mut ts::Fast, f: &[&[u8]; 7], ing_base: i64) -> 
         }
         None => (i64::MAX, u32::MAX),
     };
-    let mut ev = Ev { eid, user: 0, ingest: ing32, ts: NO_TS, pc: 0 };
+    let mut ev = Ev { eid, ehi, elo, user: 0, ingest: ing32, ts: NO_TS, pc: 0 };
     if let Some(v) = validate(ctx, tsf, f, ingest) {
         ev.user = unsafe { keys::key_padded(f[1]) };
         ev.ts = v.0;
@@ -1411,11 +1495,11 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
     });
     // ablations: each drops one piece of parse_event
     run("ev-no-ts", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
-        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0);
+        let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ ing as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[2].len() as u64); }); c });
     run("ev-no-ing", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
-        let eid = unsafe { keys::key_padded(f[0]) }; let t = tf.parse(f[2]).unwrap_or(0);
+        let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ p as u64 ^ f[4].len() as u64 ^ f[3].len() as u64); }); c });
     run("ev-no-keys", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
@@ -1423,11 +1507,11 @@ fn micro(files: &[(File, usize)], ctx: &Ctx, _ws: i64) {
         let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(f[0].len() as u64 ^ f[1].len() as u64 ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
     run("ev-no-prod", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
-        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
+        let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) };
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ f[5].len() as u64 ^ f[4].len() as u64); }); c });
     run("ev-all4", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| {
-        let eid = unsafe { keys::key_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
+        let (eid, ehi, elo) = unsafe { keys::eid_padded(f[0]) }; let ing = tf.parse(f[3]).unwrap_or(0); let t = tf.parse(f[2]).unwrap_or(0);
         let u = unsafe { keys::key_padded(f[1]) }; let p = ctx.products.get(f[5]).unwrap_or(0);
         c = c.wrapping_add(eid ^ u ^ t as u64 ^ ing as u64 ^ p as u64 ^ f[4].len() as u64); }); c });
     run("validate", &|| { let mut tf = ts::Fast::default(); let mut c = 0u64; scan::lines::<7>(&buf, start, end, |f| c += validate(ctx, &mut tf, f, 0).map_or(0, |v| v.0 as u64)); c });

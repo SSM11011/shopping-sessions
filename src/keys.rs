@@ -4,7 +4,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering::*};
+use std::sync::atomic::{AtomicU64, Ordering::*};
 use std::sync::{Mutex, OnceLock};
 
 pub const EXOTIC: u64 = 1 << 63;
@@ -22,11 +22,16 @@ pub const EMPTY: u64 = u64::MAX;
 const BUSY: u64 = 1;
 const MAX_PROBE: usize = 128;
 
+/// One slot: hi (state word), lo, prefix -- adjacent, so a lookup touches one place.
+struct Slot {
+    hi: AtomicU64,
+    lo: AtomicU64,
+    pre: AtomicU64,
+}
+
 struct Long {
     mask: usize,
-    hi: Vec<AtomicU64>,
-    lo: Vec<AtomicU64>,
-    pre: Vec<AtomicU8>,
+    slots: Vec<Slot>,
 }
 
 static LONG_TABLE: OnceLock<Long> = OnceLock::new();
@@ -35,22 +40,20 @@ static LONG_TABLE: OnceLock<Long> = OnceLock::new();
 /// any key is made; without it long IDs use the general interner.
 pub fn init_long(expected: usize) {
     let cap = (expected * 3 / 2 + 1024).next_power_of_two();
-    let alloc64 = |n: usize| -> Vec<AtomicU64> {
-        // zeroed pages straight from the allocator (fresh mmap): no fill pass
-        let layout = std::alloc::Layout::array::<u64>(n).unwrap();
-        unsafe {
-            let p = std::alloc::alloc_zeroed(layout) as *mut AtomicU64;
-            assert!(!p.is_null(), "long-id table allocation failed");
-            Vec::from_raw_parts(p, n, n)
-        }
-    };
-    let pre = unsafe {
-        let layout = std::alloc::Layout::array::<u8>(cap).unwrap();
-        let p = std::alloc::alloc_zeroed(layout) as *mut AtomicU8;
+    // zeroed pages straight from the allocator (fresh mmap): no fill pass; all-zero = empty slot
+    let slots = unsafe {
+        let layout = std::alloc::Layout::array::<Slot>(cap).unwrap();
+        let p = std::alloc::alloc_zeroed(layout) as *mut Slot;
         assert!(!p.is_null(), "long-id table allocation failed");
         Vec::from_raw_parts(p, cap, cap)
     };
-    let _ = LONG_TABLE.set(Long { mask: cap - 1, hi: alloc64(cap), lo: alloc64(cap), pre });
+    let _ = LONG_TABLE.set(Long { mask: cap - 1, slots });
+}
+
+/// (filled slots, capacity, general-interner entries): diagnostics.
+pub fn long_stats() -> (usize, usize, usize) {
+    let (f, c) = LONG_TABLE.get().map_or((0, 0), |t| (t.slots.iter().filter(|s| s.hi.load(Relaxed) != 0).count(), t.mask + 1));
+    (f, c, interner().lock().unwrap().strs.len())
 }
 
 #[inline(always)]
@@ -70,13 +73,14 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
     }
     let mut i = long_slot0(pre, hi, lo) & t.mask;
     for _ in 0..MAX_PROBE {
-        let mut h = t.hi[i].load(Acquire);
+        let sl = unsafe { t.slots.get_unchecked(i) };
+        let mut h = sl.hi.load(Acquire);
         if h == 0 {
-            match t.hi[i].compare_exchange(0, BUSY, Acquire, Acquire) {
+            match sl.hi.compare_exchange(0, BUSY, Acquire, Acquire) {
                 Ok(_) => {
-                    t.lo[i].store(lo, Relaxed);
-                    t.pre[i].store(pre, Relaxed);
-                    t.hi[i].store(hi, Release);
+                    sl.lo.store(lo, Relaxed);
+                    sl.pre.store(pre as u64, Relaxed);
+                    sl.hi.store(hi, Release);
                     return Some(EXOTIC | LONG | i as u64);
                 }
                 Err(x) => h = x,
@@ -84,9 +88,9 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
         }
         while h == BUSY {
             std::hint::spin_loop();
-            h = t.hi[i].load(Acquire);
+            h = sl.hi.load(Acquire);
         }
-        if h == hi && t.lo[i].load(Relaxed) == lo && t.pre[i].load(Relaxed) == pre {
+        if h == hi && sl.lo.load(Relaxed) == lo && sl.pre.load(Relaxed) == pre as u64 {
             return Some(EXOTIC | LONG | i as u64);
         }
         i = (i + 1) & t.mask;
@@ -97,14 +101,14 @@ fn long_key(pre: u8, hi: u64, lo: u64) -> Option<u64> {
 #[inline(always)]
 fn long_parts(k: u64) -> (u8, u64, u64) {
     let t = LONG_TABLE.get().expect("long key without table");
-    let i = (k & !(EXOTIC | LONG)) as usize;
-    (t.pre[i].load(Relaxed), t.hi[i].load(Relaxed), t.lo[i].load(Relaxed))
+    let sl = &t.slots[(k & !(EXOTIC | LONG)) as usize];
+    (sl.pre.load(Relaxed) as u8, sl.hi.load(Relaxed), sl.lo.load(Relaxed))
 }
 
 /// 33 bytes `[a-z][0-9a-f]{32}` -> (prefix, hi, lo); None for any other shape.
 #[cfg(target_feature = "avx2")]
 #[inline(always)]
-fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
+pub fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
     use std::arch::x86_64::*;
     if s.len() != 33 || !s[0].is_ascii_lowercase() {
         return None;
@@ -130,7 +134,7 @@ fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
 }
 
 #[cfg(not(target_feature = "avx2"))]
-fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
+pub fn parse_long(s: &[u8]) -> Option<(u8, u64, u64)> {
     if s.len() != 33 || !s[0].is_ascii_lowercase() {
         return None;
     }
@@ -231,6 +235,24 @@ pub fn key(s: &[u8]) -> u64 {
         Some(k) => k,
         None => exotic_key(s),
     }
+}
+
+/// Marker key for a long hex event_id carried by value (prefix in the low byte; hi/lo travel beside
+/// it). Never produced by `key`: interner indices and table slots stay far below bit 61.
+pub const LONG_EID: u64 = EXOTIC | LONG | (1 << 61);
+
+/// Event-id key: a long hex event_id is returned by value as (LONG_EID | prefix, hi, lo) instead of
+/// going through the shared table (event_ids are only compared for equality, inside their dedup
+/// partition). Reads 16 bytes like `key_padded`.
+#[inline(always)]
+pub unsafe fn eid_padded(s: &[u8]) -> (u64, u64, u64) {
+    if let Some(k) = unsafe { pack16(s) } {
+        return (k, 0, 0);
+    }
+    if let Some((p, hi, lo)) = parse_long(s) {
+        return (LONG_EID | p as u64, hi, lo);
+    }
+    (intern(s), 0, 0)
 }
 
 /// Same as `key`, but reads 16 bytes from s.as_ptr(): the caller guarantees they are readable
